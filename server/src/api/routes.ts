@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { stat } from 'node:fs/promises';
 import {
   DEFAULT_PAGE_LINES,
   MAX_PAGE_LINES,
@@ -6,8 +7,9 @@ import {
   SEARCH_MAX_BYTES,
   SEARCH_MAX_MATCHES,
 } from '../config.js';
-import { isEncoding } from '../files/encoding.js';
-import type { LogFilePool } from '../files/reader.js';
+import { detectEncoding, isEncoding, type Encoding } from '../files/encoding.js';
+import { LineIndexService, type LineIndexInput } from '../files/lineIndex.js';
+import type { LogFile, LogFilePool } from '../files/reader.js';
 import { runSearch } from '../search/search.js';
 import type { SearchDirection } from '../search/protocol.js';
 import {
@@ -30,6 +32,10 @@ interface TabParams {
 interface PageQuery {
   offset?: string;
   lines?: string;
+}
+
+interface LineQuery {
+  line?: string;
 }
 
 interface SearchBody {
@@ -59,6 +65,45 @@ function parseLines(value: string | undefined): number {
   return Math.min(MAX_PAGE_LINES, Math.floor(parsed));
 }
 
+function parseLineNumber(value: string | undefined): number {
+  if (value === undefined || value === '') throw badRequest('Укажите номер строки');
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw badRequest('line должен быть положительным целым числом');
+  }
+  return parsed;
+}
+
+/** Всё, что индексу нужно знать о файле на момент запроса. */
+function indexInput(file: LogFile): LineIndexInput {
+  return { path: file.path, id: file.id, encoding: file.encoding, size: file.size };
+}
+
+/**
+ * Индексные маршруты не берут файл из пула: иначе после каждого tail-append они
+ * переоткрывали бы хэндл и держали его до простоя, мешая ночной ротации через rename.
+ * stat и автоопределение кодировки открывают и сразу закрывают собственные хэндлы.
+ */
+const detectedEncodings = new Map<string, { encoding: Encoding; size: number }>();
+
+async function indexInputForTab(tab: TabState): Promise<LineIndexInput> {
+  const stats = await stat(tab.path, { bigint: true });
+  const id = `${stats.dev.toString()}:${stats.ino.toString()}`;
+  const size = Number(stats.size);
+  let encoding = tab.encoding ?? undefined;
+  if (!encoding) {
+    const cached = detectedEncodings.get(id);
+    // Усечение могло сменить содержимое и кодировку: тогда автоопределяем заново.
+    if (cached && size >= cached.size) {
+      encoding = cached.encoding;
+    } else {
+      encoding = await detectEncoding(tab.path);
+      detectedEncodings.set(id, { encoding, size });
+    }
+  }
+  return { path: tab.path, id, encoding, size };
+}
+
 function findTab(profile: Profile, id: string): TabState {
   const tab = profile.tabs.find((item) => item.id === id);
   if (!tab) throw Object.assign(new Error('Вкладка не найдена'), { statusCode: 404 });
@@ -82,7 +127,11 @@ function regexIssues(rules: Array<{ id: string; match: string; isRegex: boolean 
   return issues;
 }
 
-export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): Promise<void> {
+export async function registerRoutes(
+  app: FastifyInstance,
+  pool: LogFilePool,
+  lineIndex = new LineIndexService(),
+): Promise<void> {
   app.get('/api/v1/health', async () => ({
     ok: true,
     name: 'aplog-viewer',
@@ -213,7 +262,9 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const tab = findTab(profile, id);
     const file = await pool.get(tab.path, tab.encoding ?? undefined);
     const page = await file.readPage(parseOffset(query.offset), parseLines(query.lines));
-    return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+    // Номер первой строки знает только индекс; без покрытия — null, и UI покажет `·`.
+    const firstLine = page.lines[0] ? await lineIndex.lineNumberAt(indexInput(file), page.lines[0].offset) : null;
+    return { tabId: tab.id, path: tab.path, title: tab.title, ...page, firstLine };
   });
 
   app.get('/api/v1/tabs/:id/last-page', async (request) => {
@@ -223,7 +274,8 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const tab = findTab(profile, id);
     const file = await pool.get(tab.path, tab.encoding ?? undefined);
     const page = await file.readLastPage(parseLines(query.lines));
-    return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+    const firstLine = page.lines[0] ? await lineIndex.lineNumberAt(indexInput(file), page.lines[0].offset) : null;
+    return { tabId: tab.id, path: tab.path, title: tab.title, ...page, firstLine };
   });
 
   app.get('/api/v1/tabs/:id/page-before', async (request) => {
@@ -234,6 +286,45 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const file = await pool.get(tab.path, tab.encoding ?? undefined);
     const page = await file.pageBefore(parseOffset(query.offset), parseLines(query.lines));
     return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+  });
+
+  app.post('/api/v1/tabs/:id/line-index', async (request) => {
+    const { id } = request.params as TabParams;
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    // stat здесь же: индекс должен видеть актуальный размер после дописывания.
+    return { tabId: tab.id, path: tab.path, ...(await lineIndex.start(await indexInputForTab(tab))) };
+  });
+
+  app.get('/api/v1/tabs/:id/line-index', async (request) => {
+    const { id } = request.params as TabParams;
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    return { tabId: tab.id, path: tab.path, ...(await lineIndex.status(await indexInputForTab(tab))) };
+  });
+
+  app.get('/api/v1/tabs/:id/line-number', async (request) => {
+    const { id } = request.params as TabParams;
+    const query = request.query as PageQuery;
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    const offset = parseOffset(query.offset);
+    const input = await indexInputForTab(tab);
+    const status = await lineIndex.status(input);
+    const line = await lineIndex.lineNumberAt(input, offset);
+    return { tabId: tab.id, path: tab.path, offset, line, ...status };
+  });
+
+  app.get('/api/v1/tabs/:id/line-offset', async (request) => {
+    const { id } = request.params as TabParams;
+    const query = request.query as LineQuery;
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    const line = parseLineNumber(query.line);
+    const input = await indexInputForTab(tab);
+    const status = await lineIndex.status(input);
+    const offset = await lineIndex.offsetForLine(input, line);
+    return { tabId: tab.id, path: tab.path, line, offset, ...status };
   });
 
   app.post('/api/v1/tabs/:id/search', async (request) => {

@@ -291,6 +291,29 @@ body {
   padding: 2px 7px;
 }
 
+.line-jump {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+}
+
+.line-input {
+  width: 68px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+.line-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 .search-bar .rule-remove {
   margin-left: auto;
 }
@@ -380,11 +403,43 @@ select {
     inset 3px 0 0 #b8860b;
 }
 
+/* Строка, к которой пришёл Ctrl+G: временная синяя рамка поверх цвета правила. */
+.row-target {
+  box-shadow: inset 0 0 0 1px #4c8dff;
+  z-index: 1;
+}
+
+.row-hit.row-target {
+  box-shadow:
+    inset 0 0 0 1px #4c8dff,
+    inset 3px 0 0 #b8860b;
+}
+
 .row-current .text {
   text-shadow: 0 0 6px rgba(227, 179, 65, 0.45);
 }
 
-/* Линейка слева: точка на каждой строке, крупнее каждые 10, с ореолом каждые 100. */
+/* Линейка слева: номер строки файла и точка. Номер пуст (`·`), пока индекс не покрыл
+   первую строку буфера: приблизительное число здесь было бы хуже отсутствия. */
+.gutter {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  height: 100%;
+  padding-left: 4px;
+  user-select: none;
+}
+
+.line-no {
+  min-width: 52px;
+  padding-right: 6px;
+  text-align: right;
+  color: #7f8899;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Точка на каждой строке, крупнее каждые 10, с ореолом каждые 100. */
 .dot {
   flex: 0 0 26px;
   width: 26px;

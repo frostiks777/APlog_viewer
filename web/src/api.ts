@@ -14,6 +14,8 @@ export interface LogPage {
   mtimeMs: number;
   encoding: string;
   event: 'ok' | 'rotated' | 'truncated';
+  /** Номер первой строки страницы; null, если разреженный индекс её ещё не покрывает. */
+  firstLine?: number | null;
 }
 
 export interface TabState {
@@ -121,6 +123,31 @@ export interface SearchParams {
   limit?: number;
 }
 
+export interface LineIndexStatus {
+  tabId?: string;
+  path?: string;
+  state: 'idle' | 'building' | 'ready' | 'error';
+  /** Сколько начал строк известно: столько строк можно пронумеровать точно. */
+  knownLines: number;
+  scannedTo: number;
+  size: number;
+  step: number;
+  complete: boolean;
+  encoding: string;
+  fromCache: boolean;
+  error: string | null;
+}
+
+export interface LineNumberResult extends LineIndexStatus {
+  offset: number;
+  line: number | null;
+}
+
+export interface LineOffsetResult extends LineIndexStatus {
+  line: number;
+  offset: number | null;
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined;
   let response: Response;
@@ -156,6 +183,13 @@ export const api = {
   pageBefore: (id: string, offset: number, lines: number) =>
     request<LogPage>(`/api/v1/tabs/${id}/page-before?offset=${offset}&lines=${lines}`),
   tail: (id: string, offset: number) => request<LogPage>(`/api/v1/tabs/${id}/tail?offset=${offset}`),
+  lineIndex: (id: string) => request<LineIndexStatus>(`/api/v1/tabs/${id}/line-index`),
+  startLineIndex: (id: string) =>
+    request<LineIndexStatus>(`/api/v1/tabs/${id}/line-index`, { method: 'POST' }),
+  lineNumber: (id: string, offset: number) =>
+    request<LineNumberResult>(`/api/v1/tabs/${id}/line-number?offset=${offset}`),
+  lineOffset: (id: string, line: number) =>
+    request<LineOffsetResult>(`/api/v1/tabs/${id}/line-offset?line=${line}`),
   search: (id: string, params: SearchParams) =>
     request<SearchResult>(`/api/v1/tabs/${id}/search`, {
       method: 'POST',

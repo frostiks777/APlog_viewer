@@ -35,3 +35,12 @@ export const SEARCH_DEFAULT_MATCHES = 200;
 export const SEARCH_MAX_MATCHES = 500;
 /** Бюджет воркера: дольше держать поток с потенциально зависшим regex нельзя. */
 export const SEARCH_TIMEOUT_MS = 5000;
+
+/**
+ * Разреженный индекс строк: засечка каждые 1024 строки. Номер ищется чтением не больше
+ * одного блока от засечки. Строим окнами по 1 МБ и сохраняем прогресс каждые 32 МБ,
+ * чтобы перезапуск на гигабайтном файле не начинался с нуля.
+ */
+export const LINE_INDEX_STEP = 1024;
+export const LINE_INDEX_CHUNK_BYTES = 1024 * 1024;
+export const LINE_INDEX_SAVE_BYTES = 32 * 1024 * 1024;

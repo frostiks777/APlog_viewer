@@ -25,6 +25,8 @@ node scripts/check-rules.mjs       # правила и фильтры (см. .ag
 node scripts/check-search.mjs      # поиск по файлу через API
 node scripts/check-search-ui.mjs   # поиск по файлу в браузере (headless Edge)
 node scripts/check-search-hits.mjs # подсветка всех совпадений (headless Edge)
+node scripts/check-lines.mjs       # номера строк и индекс через API
+node scripts/check-lines-ui.mjs    # номера строк и Ctrl+G в браузере (headless Edge)
 node --expose-gc scripts/check-pool.mjs  # пул файлов, сервер не нужен
 ```
 
@@ -37,10 +39,12 @@ node --expose-gc scripts/check-pool.mjs  # пул файлов, сервер н�
   кодировке, идентичность `dev:ino`, события ротации/усечения.
 - `server/src/files/encoding.ts` — BOM и автоопределение кодировки.
 - `server/src/files/lines.ts` — общий разбор строк: CRLF, UTF-16, границы и BOM.
+- `server/src/files/lineIndex.ts` — разреженный индекс строк: засечка каждые 1024, кэш
+  по `dev:ino + encoding`, фоновая достройка после append.
 - `server/src/search/` — поиск по всему файлу в worker-потоке: курсоры, бюджет 5 с.
 - `server/src/api/routes.ts` — REST v1 (вкладки, страницы, поиск, tail, last-page, page-before).
 - `server/src/profile/store.ts` — профиль `.aplog/profile.json`, `.bak`, атомарная запись.
-- `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, поиск, tail.
+- `web/src/App.tsx` — вкладки, виртуализованный список, номера строк и `Ctrl+G`, поиск, tail.
 - `web/src/RulesPanel.tsx` — выдвижная панель правил подсветки и фильтров.
 - `web/src/rules/` — компиляция правил, матчинг в Web Worker с бюджетом времени, кэш стилей.
 - `web/src/search/` — сессия поиска и отдельный воркер подсветки всех совпадений.
@@ -138,6 +142,7 @@ scripts/notify.ps1 "Заголовок" "Текст"` (сам файл `scripts/
 `npm run typecheck`, `npm run build`, `check-encodings` (4/4), `check-rotation` (4/4),
 `check-rules-semantics` (16/16), `check-rules` (14/14), `check-rules-timeout` (4/4),
 `check-filter` (3/3), `check-panel` (5/5), `check-search` (22/22), `check-search-ui` (9/9),
-`check-search-hits` (12/12) и `check-pool` (5/5) зелёные на 2026-11-13. Юнит-фреймворка нет —
-это осознанно до появления чистой логики, которую дешевле покрыть тестами, чем сценарием.
-Красная проверка после твоего диффа — регрессия, а не известное исключение.
+`check-search-hits` (12/12), `check-lines` (40/40), `check-lines-ui` (16/16) и `check-pool` (5/5)
+зелёные на 2026-11-13. Юнит-фреймворка нет — это осознанно до появления чистой логики, которую
+дешевле покрыть тестами, чем сценарием. Красная проверка после твоего диффа — регрессия, а не
+известное исключение.

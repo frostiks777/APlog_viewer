@@ -3,6 +3,7 @@ import {
   api,
   type FilterRule,
   type HighlightRule,
+  type LineIndexStatus,
   type LogLine,
   type PanelsState,
   type Profile,
@@ -59,6 +60,13 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [filterPaused, setFilterPaused] = useState(false);
   const [resetToken, setResetToken] = useState(0);
+  /** Номер первой строки буфера; null — индекс её ещё не покрывает, в линейке `·`. */
+  const [lineBase, setLineBase] = useState<number | null>(null);
+  const [indexStatus, setIndexStatus] = useState<LineIndexStatus | null>(null);
+  const [indexNonce, setIndexNonce] = useState(0);
+  const [goToValue, setGoToValue] = useState('');
+  const [goToNotice, setGoToNotice] = useState<string | null>(null);
+  const [targetOffset, setTargetOffset] = useState<number | null>(null);
   const [saving, setSaving] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [savingError, setSavingError] = useState<string | null>(null);
 
@@ -70,6 +78,7 @@ export default function App() {
   const savedSettingsRef = useRef({ rules: '', filters: '' });
   const savedUiRef = useRef('');
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const lineInputRef = useRef<HTMLInputElement>(null);
   const activeTabRef = useRef<TabState | null>(null);
   const linesRef = useRef<LogLine[]>([]);
   const revealedMatchRef = useRef('');
@@ -99,6 +108,15 @@ export default function App() {
 
   const applyPage = useCallback((page: Awaited<ReturnType<typeof api.page>>, mode: 'replace' | 'append') => {
     if (mode === 'append' && atBottomRef.current) pendingScrollRef.current = 'end';
+    if (mode === 'replace') {
+      setLineBase(page.firstLine ?? null);
+    } else if (page.lines.length > 0) {
+      // При переполнении буфера старые строки уходят из начала — база сдвигается.
+      const overflow = Math.max(0, linesRef.current.length + page.lines.length - MAX_BUFFERED_LINES);
+      if (overflow > 0) setLineBase((base) => (base === null ? null : base + overflow));
+      // Файл вырос: индекс нужно достроить, иначе новые строки останутся без номеров.
+      setIndexNonce((nonce) => nonce + 1);
+    }
     setLines((current) => {
       if (mode === 'replace') return page.lines;
       const next = [...current, ...page.lines];
@@ -117,6 +135,8 @@ export default function App() {
       const page = await api.lastPage(tab.id, PAGE_LINES);
       pendingScrollRef.current = 'end';
       setLines(page.lines);
+      setLineBase(page.firstLine ?? null);
+      setTargetOffset(null);
       setEndOffset(page.endOffset);
       setEof(true);
       setFileSize(page.size);
@@ -138,6 +158,8 @@ export default function App() {
     try {
       const page = await api.page(tab.id, offset, PAGE_LINES);
       setLines(page.lines);
+      setLineBase(page.firstLine ?? null);
+      setTargetOffset(null);
       setEndOffset(page.endOffset);
       setEof(page.eof);
       setFileSize(page.size);
@@ -165,6 +187,7 @@ export default function App() {
       const page = await api.page(tab.id, offset, PAGE_LINES);
       if (activeTabRef.current?.id !== tab.id) return;
       setLines(page.lines);
+      setLineBase(page.firstLine ?? null);
       setEndOffset(page.endOffset);
       setEof(page.eof);
       setFileSize(page.size);
@@ -273,6 +296,7 @@ export default function App() {
         const page = await api.pageBefore(activeId, first.offset, PAGE_LINES);
         if (page.lines.length > 0) {
           setLines((current) => [...page.lines, ...current]);
+          setLineBase((base) => (base === null ? null : Math.max(1, base - page.lines.length)));
           if (!auto && !filtersActiveRef.current) {
             const element = logRef.current;
             if (element) {
@@ -308,6 +332,8 @@ export default function App() {
                 ? 'Файл ротирован — открываю новый'
                 : 'Файл усечён — перечитываю с конца',
             );
+            // Новый файл или новое содержимое — прежний индекс к ним не относится.
+            setIndexNonce((nonce) => nonce + 1);
             reloadEndRef.current();
             return;
           }
@@ -369,6 +395,28 @@ export default function App() {
   }, [filtersActive, engine.hidden, lines]);
 
   const rulesById = useMemo(() => new Map(rules.map((rule) => [rule.id, rule])), [rules]);
+
+  /**
+   * Номер строки по её смещению. Ищем в полном буфере двоичным поиском, а не по
+   * видимому списку: фильтр скрывает строки, но не меняет их номера в файле.
+   */
+  const lineNumberAtOffset = useCallback(
+    (offset: number): number | null => {
+      if (lineBase === null) return null;
+      let low = 0;
+      let high = lines.length - 1;
+      while (low <= high) {
+        const middle = (low + high) >> 1;
+        const current = lines[middle];
+        if (!current) break;
+        if (current.offset === offset) return lineBase + middle;
+        if (current.offset < offset) low = middle + 1;
+        else high = middle - 1;
+      }
+      return null;
+    },
+    [lines, lineBase],
+  );
 
   const styleFor = useCallback(
     (offset: number): CSSProperties => {
@@ -446,6 +494,99 @@ export default function App() {
   });
 
   /**
+   * Разреженный индекс строится в фоне. POST запускает/достраивает его, GET только
+   * читает прогресс, поэтому опрос не дёргает stat по SMB каждую секунду.
+   */
+  useEffect(() => {
+    if (!activeId) {
+      setIndexStatus(null);
+      return;
+    }
+    let stopped = false;
+    let timer = 0;
+    let started = false;
+
+    const tick = async () => {
+      try {
+        const status = started ? await api.lineIndex(activeId) : await api.startLineIndex(activeId);
+        started = true;
+        if (stopped) return;
+        setIndexStatus(status);
+        if (status.complete) return;
+        // Сборка не идёт (усечение или прошлый сбой) — на следующем тике запускаем снова.
+        if (status.state === 'idle' || status.state === 'error') started = false;
+        timer = window.setTimeout(() => void tick(), 700);
+      } catch {
+        if (stopped) return;
+        started = false;
+        timer = window.setTimeout(() => void tick(), 2000);
+      }
+    };
+
+    void tick();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeId, activeTab?.encoding, indexNonce]);
+
+  const firstOffset = lines[0]?.offset ?? null;
+
+  /**
+   * Страница загрузилась раньше, чем индекс дошёл до её первой строки. Когда дошёл —
+   * спрашиваем точный номер один раз и дальше нумеруем буфер непрерывно.
+   */
+  useEffect(() => {
+    if (!activeId || lineBase !== null || firstOffset === null) return;
+    if (!indexStatus || indexStatus.scannedTo === 0) return;
+    let stopped = false;
+    void api
+      .lineNumber(activeId, firstOffset)
+      .then((result) => {
+        if (!stopped && result.line !== null) setLineBase(result.line);
+      })
+      .catch(() => undefined);
+    return () => {
+      stopped = true;
+    };
+  }, [activeId, firstOffset, indexStatus?.scannedTo, lineBase]);
+
+  const goToLine = useCallback(async () => {
+    const target = Number.parseInt(goToValue.trim(), 10);
+    if (!activeId) return;
+    if (!Number.isFinite(target) || target < 1) {
+      setGoToNotice('Введите номер строки');
+      return;
+    }
+    const tab = activeTabRef.current;
+    if (!tab) return;
+    try {
+      const result = await api.lineOffset(activeId, target);
+      setIndexStatus(result);
+      if (result.offset !== null) {
+        setGoToNotice(null);
+        await loadAt(tab, result.offset);
+        setTargetOffset(result.offset);
+        return;
+      }
+      if (result.complete) {
+        setGoToNotice(`В файле ${result.knownLines.toLocaleString('ru-RU')} строк`);
+      } else {
+        setGoToNotice(`Известно ${result.knownLines.toLocaleString('ru-RU')} строк — индекс строится`);
+        setIndexNonce((nonce) => nonce + 1);
+      }
+    } catch (cause) {
+      setGoToNotice((cause as Error).message);
+    }
+  }, [activeId, goToValue, loadAt]);
+
+  useEffect(() => {
+    if (targetOffset === null) return;
+    const timer = window.setTimeout(() => setTargetOffset(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [targetOffset]);
+
+  /**
    * Строка текущего совпадения видна даже при активном фильтре: иначе переход
    * к найденной строке заканчивался бы пустым списком.
    */
@@ -508,6 +649,13 @@ export default function App() {
         event.preventDefault();
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'g') {
+        if (!activeTabRef.current) return;
+        event.preventDefault();
+        lineInputRef.current?.focus();
+        lineInputRef.current?.select();
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -664,6 +812,11 @@ export default function App() {
   const atEnd =
     eof && renderLines.length > 0 && scrollTop + viewportHeight >= renderLines.length * rowHeight - rowHeight * 2;
   const filterLimitReached = filtersActive && lines.length >= FILTER_BUFFER_LIMIT;
+  const indexPercent = indexStatus
+    ? indexStatus.size === 0
+      ? 100
+      : Math.min(100, Math.floor((indexStatus.scannedTo / indexStatus.size) * 100))
+    : null;
 
   return (
     <div className="app">
@@ -841,6 +994,31 @@ export default function App() {
             {!search.error && searchHits.timedOut && (
               <span className="muted">подсветка совпадений отключена — измените запрос</span>
             )}
+            <label className="line-jump">
+              <span>строка</span>
+              <input
+                ref={lineInputRef}
+                className="line-input"
+                value={goToValue}
+                onChange={(event) => {
+                  setGoToValue(event.target.value);
+                  setGoToNotice(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') {
+                    event.preventDefault();
+                    void goToLine();
+                  } else if (event.key === 'Escape') {
+                    event.currentTarget.blur();
+                  }
+                }}
+                placeholder="N"
+                spellCheck={false}
+                aria-label="Перейти к строке"
+                title="Перейти к строке (Ctrl+G)"
+              />
+            </label>
+            {goToNotice && <span className="muted">{goToNotice}</span>}
             {search.query && (
               <button className="rule-remove" title="Очистить поиск" onClick={search.clear}>
                 ×
@@ -869,18 +1047,24 @@ export default function App() {
 
         <div className="log" ref={logRef} onScroll={onScroll}>
           <div className="spacer" style={{ height: renderLines.length * rowHeight }}>
-            {visibleRows.map((line, index) => (
-              <div
-                key={line.offset}
-                className={`row ${searchHits.hits?.has(line.offset) ? 'row-hit' : ''} ${
-                  search.match?.offset === line.offset ? 'row-current' : ''
-                }`}
-                style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.offset) }}
-              >
-                <span className={dotClass(start + index)} />
-                <span className="text">{line.text || ' '}</span>
-              </div>
-            ))}
+            {visibleRows.map((line, index) => {
+              const lineNumber = lineNumberAtOffset(line.offset);
+              return (
+                <div
+                  key={line.offset}
+                  className={`row ${searchHits.hits?.has(line.offset) ? 'row-hit' : ''} ${
+                    search.match?.offset === line.offset ? 'row-current' : ''
+                  } ${targetOffset === line.offset ? 'row-target' : ''}`}
+                  style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.offset) }}
+                >
+                  <span className="gutter">
+                    <span className="line-no">{lineNumber === null ? '·' : lineNumber}</span>
+                    <span className={dotClass(lineNumber ?? start + index)} />
+                  </span>
+                  <span className="text">{line.text || ' '}</span>
+                </div>
+              );
+            })}
           </div>
           {activeTab && filtersActive && renderLines.length === 0 && (
             <div className="empty">
@@ -893,6 +1077,17 @@ export default function App() {
 
         <footer className="status">
           <span>строк в буфере: {lines.length.toLocaleString('ru-RU')}</span>
+          {indexPercent !== null && (
+            <span title="разреженный индекс строк: засечка каждые 1024 строки">
+              индекс {indexPercent}%{indexStatus?.complete ? '' : '…'}
+            </span>
+          )}
+          {indexStatus?.complete && (
+            <span>строк в файле: {indexStatus.knownLines.toLocaleString('ru-RU')}</span>
+          )}
+          {indexStatus?.state === 'error' && (
+            <span className="notice">индекс: {indexStatus.error}</span>
+          )}
           {filtersActive && <span>показано: {renderLines.length.toLocaleString('ru-RU')}</span>}
           <span>смещение: {endOffset.toLocaleString('ru-RU')} Б</span>
           <span>{atEnd ? 'конец файла' : eof ? 'конец прочитан' : 'загружено частично'}</span>

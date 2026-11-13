@@ -190,7 +190,9 @@ export class LogFile {
    * просмотр. Возвращает последние maxLines строк, включая незавершённую последнюю.
    */
   async readLastPage(maxLines: number): Promise<LogPage> {
-    const event = await this.refresh(false);
+    // «В конец» — явное действие: стат обязателен, иначе дописанные за последние
+    // секунды строки не попадут на страницу, а номер её первой строки разойдётся с индексом.
+    const event = await this.refresh(true);
     const size = this.identity.size;
     if (size === 0) return { ...this.page([], 0, true), event };
 
