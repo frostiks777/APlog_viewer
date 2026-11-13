@@ -6,7 +6,8 @@ const MAX_BUFFERED_LINES = 60_000;
 const ENCODINGS = ['utf-8', 'cp1251', 'cp866', 'utf-16le', 'utf-16be', 'latin1'] as const;
 
 interface DisplayLine extends LogLine {
-  n: number | null;
+  /** Порядковый номер строки в буфере — только для «линейки» слева, не номер в файле. */
+  seq: number;
 }
 
 type Matcher = (text: string) => boolean;
@@ -37,6 +38,17 @@ function formatSize(bytes: number): string {
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
 }
 
+/** Отрицательные seq тоже должны давать ровный шаг «каждые 10/100». */
+function isMultiple(value: number, step: number): boolean {
+  return ((value % step) + step) % step === 0;
+}
+
+function dotClass(seq: number): string {
+  if (isMultiple(seq, 100)) return 'dot dot-100';
+  if (isMultiple(seq, 10)) return 'dot dot-10';
+  return 'dot';
+}
+
 export default function App() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -49,8 +61,13 @@ export default function App() {
   const [pathInput, setPathInput] = useState('');
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(600);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const logRef = useRef<HTMLDivElement>(null);
+  const loadingRef = useRef(false);
+  const pendingScrollRef = useRef<'end' | null>(null);
+  const atBottomRef = useRef(true);
+  const reloadEndRef = useRef<() => void>(() => undefined);
   const stateRef = useRef({ activeId, endOffset, eof, linesLength: 0, tail: false });
   stateRef.current = {
     activeId,
@@ -63,20 +80,56 @@ export default function App() {
   const activeTab = profile?.tabs.find((tab) => tab.id === activeId) ?? null;
   const rowHeight = profile?.ui.rowHeight ?? 20;
 
-  const loadFirstPage = useCallback(async (tab: TabState, offset = 0) => {
+  const applyPage = useCallback((page: Awaited<ReturnType<typeof api.page>>, mode: 'replace' | 'append') => {
+    if (mode === 'append' && atBottomRef.current) pendingScrollRef.current = 'end';
+    setLines((current) => {
+      if (mode === 'replace') return page.lines.map((line, index) => ({ ...line, seq: index }));
+      const base = (current[current.length - 1]?.seq ?? -1) + 1;
+      const next = [...current, ...page.lines.map((line, index) => ({ ...line, seq: base + index }))];
+      return next.length > MAX_BUFFERED_LINES ? next.slice(next.length - MAX_BUFFERED_LINES) : next;
+    });
+    setEndOffset(page.endOffset);
+    setEof(page.eof);
+    setFileSize(page.size);
+  }, []);
+
+  const loadEnd = useCallback(async (tab: TabState) => {
+    loadingRef.current = true;
+    setBusy(true);
+    setError(null);
+    try {
+      const page = await api.lastPage(tab.id, PAGE_LINES);
+      pendingScrollRef.current = 'end';
+      setLines(page.lines.map((line, index) => ({ ...line, seq: index })));
+      setEndOffset(page.endOffset);
+      setEof(true);
+      setFileSize(page.size);
+      setScrollTop(0);
+      if (logRef.current) logRef.current.scrollTop = 0;
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      loadingRef.current = false;
+      setBusy(false);
+    }
+  }, []);
+
+  const loadAt = useCallback(async (tab: TabState, offset: number) => {
+    loadingRef.current = true;
     setBusy(true);
     setError(null);
     try {
       const page = await api.page(tab.id, offset, PAGE_LINES);
-      setLines(page.lines.map((line, index) => ({ ...line, n: offset === 0 ? index + 1 : null })));
+      setLines(page.lines.map((line, index) => ({ ...line, seq: index })));
       setEndOffset(page.endOffset);
       setEof(page.eof);
       setFileSize(page.size);
-      if (logRef.current) logRef.current.scrollTop = 0;
       setScrollTop(0);
+      if (logRef.current) logRef.current.scrollTop = 0;
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
+      loadingRef.current = false;
       setBusy(false);
     }
   }, []);
@@ -87,15 +140,16 @@ export default function App() {
         const loaded = await api.profile();
         setProfile(loaded);
         const first = loaded.tabs.find((tab) => tab.id === loaded.activeTabId) ?? loaded.tabs[0] ?? null;
-        if (first) {
-          setActiveId(first.id);
-          await loadFirstPage(first, first.scrollOffset);
-        }
+        if (!first) return;
+        setActiveId(first.id);
+        // Открываем конец файла: это хвостовой просмотр, а не чтение с начала.
+        if (first.tail) await loadEnd(first);
+        else await loadAt(first, first.scrollOffset);
       } catch (cause) {
         setError((cause as Error).message);
       }
     })();
-  }, [loadFirstPage]);
+  }, [loadAt, loadEnd]);
 
   useEffect(() => {
     const element = logRef.current;
@@ -106,49 +160,67 @@ export default function App() {
     return () => observer.disconnect();
   }, [activeId]);
 
+  useEffect(() => {
+    reloadEndRef.current = () => {
+      if (activeTab) void loadEnd(activeTab);
+    };
+  }, [activeTab, loadEnd]);
+
+  useEffect(() => {
+    if (pendingScrollRef.current !== 'end') return;
+    const element = logRef.current;
+    if (!element) return;
+    element.scrollTop = element.scrollHeight;
+    setScrollTop(element.scrollTop);
+    pendingScrollRef.current = null;
+  }, [lines]);
+
   const appendNext = useCallback(async () => {
-    if (!activeId || eof || busy) return;
+    if (!activeId || eof || loadingRef.current) return;
+    loadingRef.current = true;
     setBusy(true);
     try {
       const page = await api.page(activeId, endOffset, PAGE_LINES);
-      if (page.lines.length > 0) {
-        setLines((current) => {
-          const next = [...current, ...page.lines.map((line) => ({ ...line, n: null }))];
-          return next.length > MAX_BUFFERED_LINES ? next.slice(next.length - MAX_BUFFERED_LINES) : next;
-        });
+      if (page.lines.length > 0) applyPage(page, 'append');
+      else {
+        setEndOffset(page.endOffset);
+        setEof(page.eof);
+        setFileSize(page.size);
       }
-      setEndOffset(page.endOffset);
-      setEof(page.eof);
-      setFileSize(page.size);
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
+      loadingRef.current = false;
       setBusy(false);
     }
-  }, [activeId, busy, endOffset, eof]);
+  }, [activeId, applyPage, endOffset, eof]);
 
   const loadPrevious = useCallback(async () => {
-    if (!activeId || busy) return;
+    if (!activeId || loadingRef.current) return;
     const first = lines[0];
     if (!first || first.offset === 0) return;
+    loadingRef.current = true;
     setBusy(true);
     try {
       const page = await api.pageBefore(activeId, first.offset, PAGE_LINES);
       if (page.lines.length > 0) {
-        setLines((current) => [...page.lines.map((line) => ({ ...line, n: null })), ...current]);
+        setLines((current) => [
+          ...page.lines.map((line, index) => ({ ...line, seq: first.seq - page.lines.length + index })),
+          ...current,
+        ]);
         const element = logRef.current;
         if (element) {
-          const delta = page.lines.length * rowHeight;
-          element.scrollTop += delta;
+          element.scrollTop += page.lines.length * rowHeight;
           setScrollTop(element.scrollTop);
         }
       }
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
+      loadingRef.current = false;
       setBusy(false);
     }
-  }, [activeId, busy, lines, rowHeight]);
+  }, [activeId, lines, rowHeight]);
 
   // Хвост: опрос раз в 1.5 с, только когда вкладка в tail-режиме и мы уже в конце файла.
   useEffect(() => {
@@ -161,17 +233,20 @@ export default function App() {
       void (async () => {
         try {
           const page = await api.tail(state.activeId as string, state.endOffset);
+          if (page.event !== 'ok') {
+            setNotice(
+              page.event === 'rotated'
+                ? 'Файл ротирован — открываю новый'
+                : 'Файл усечён — перечитываю с конца',
+            );
+            reloadEndRef.current();
+            return;
+          }
           if (page.lines.length === 0) {
             setFileSize(page.size);
             return;
           }
-          setLines((current) => {
-            const next = [...current, ...page.lines.map((line) => ({ ...line, n: null }))];
-            return next.length > MAX_BUFFERED_LINES ? next.slice(next.length - MAX_BUFFERED_LINES) : next;
-          });
-          setEndOffset(page.endOffset);
-          setEof(page.eof);
-          setFileSize(page.size);
+          applyPage(page, 'append');
         } catch {
           /* шара могла отвалиться — молчим, следующий тик повторит */
         }
@@ -182,16 +257,17 @@ export default function App() {
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [activeId, activeTab?.tail]);
+  }, [activeId, activeTab?.tail, applyPage]);
 
   const onScroll = useCallback(() => {
     const element = logRef.current;
     if (!element) return;
     const top = element.scrollTop;
     setScrollTop(top);
-    const nearBottom = top + element.clientHeight >= lines.length * rowHeight - rowHeight * 4;
-    if (nearBottom) void appendNext();
-  }, [appendNext, lines.length, rowHeight]);
+    atBottomRef.current = top + element.clientHeight >= element.scrollHeight - 4;
+    if (top + element.clientHeight >= lines.length * rowHeight - rowHeight * 4) void appendNext();
+    if (top < rowHeight * 3) void loadPrevious();
+  }, [appendNext, lines.length, loadPrevious, rowHeight]);
 
   const matchers = useMemo(() => {
     if (!profile) return [] as Array<{ rule: HighlightRule; test: Matcher }>;
@@ -230,7 +306,7 @@ export default function App() {
       setProfile(next);
       setActiveId(tab.id);
       setPathInput('');
-      await loadFirstPage(tab, 0);
+      await loadEnd(tab);
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -241,7 +317,8 @@ export default function App() {
   const selectTab = async (tab: TabState) => {
     setActiveId(tab.id);
     await api.activateTab(tab.id).catch(() => undefined);
-    await loadFirstPage(tab, tab.scrollOffset);
+    if (tab.tail) await loadEnd(tab);
+    else await loadAt(tab, tab.scrollOffset);
   };
 
   const closeTab = async (tab: TabState) => {
@@ -251,8 +328,10 @@ export default function App() {
     if (activeId === tab.id) {
       const fallback = next.tabs[0] ?? null;
       setActiveId(fallback?.id ?? null);
-      if (fallback) await loadFirstPage(fallback, fallback.scrollOffset);
-      else setLines([]);
+      if (fallback) {
+        if (fallback.tail) await loadEnd(fallback);
+        else await loadAt(fallback, fallback.scrollOffset);
+      } else setLines([]);
     }
   };
 
@@ -268,13 +347,19 @@ export default function App() {
         ? { ...current, tabs: current.tabs.map((tab) => (tab.id === updated.id ? updated : tab)) }
         : current,
     );
-    if ('encoding' in patch) await loadFirstPage(updated, 0);
+    if ('encoding' in patch) await loadEnd(updated);
   };
 
-  const firstLine = lines[0];
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), 6000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 12);
   const end = Math.min(lines.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 12);
   const visible = lines.slice(start, end);
+  const atEnd = eof && lines.length > 0 && scrollTop + viewportHeight >= lines.length * rowHeight - rowHeight * 2;
 
   return (
     <div className="app">
@@ -359,8 +444,20 @@ export default function App() {
                 следить
               </label>
 
-              <button className="control" onClick={() => void loadFirstPage(activeTab, 0)} disabled={busy}>
-                перечитать
+              <button
+                className="control"
+                onClick={() => void loadPrevious()}
+                disabled={busy || !lines[0] || lines[0].offset === 0}
+              >
+                выше
+              </button>
+
+              <button className="control" onClick={() => void loadEnd(activeTab)} disabled={busy}>
+                в конец
+              </button>
+
+              <button className="control" onClick={() => void loadAt(activeTab, 0)} disabled={busy}>
+                в начало
               </button>
             </div>
           )}
@@ -369,25 +466,17 @@ export default function App() {
         {error && <div className="error">{error}</div>}
 
         <div className="log" ref={logRef} onScroll={onScroll}>
-          {firstLine && firstLine.offset > 0 && (
-            <button className="load-prev" onClick={() => void loadPrevious()}>
-              ↑ загрузить выше
-            </button>
-          )}
           <div className="spacer" style={{ height: lines.length * rowHeight }}>
-            {visible.map((line, index) => {
-              const position = start + index;
-              return (
-                <div
-                  key={`${line.offset}-${position}`}
-                  className="row"
-                  style={{ top: position * rowHeight, height: rowHeight, ...styleFor(line.text) }}
-                >
-                  {profile?.ui.showLineNumbers && line.n !== null && <span className="ln">{line.n}</span>}
-                  <span className="text">{line.text || ' '}</span>
-                </div>
-              );
-            })}
+            {visible.map((line, index) => (
+              <div
+                key={`${line.offset}-${line.seq}`}
+                className="row"
+                style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.text) }}
+              >
+                <span className={dotClass(line.seq)} />
+                <span className="text">{line.text || ' '}</span>
+              </div>
+            ))}
           </div>
           {!activeTab && <div className="empty">Выберите вкладку или добавьте файл слева</div>}
         </div>
@@ -395,7 +484,8 @@ export default function App() {
         <footer className="status">
           <span>строк в буфере: {lines.length.toLocaleString('ru-RU')}</span>
           <span>смещение: {endOffset.toLocaleString('ru-RU')} Б</span>
-          <span>{eof ? 'конец файла' : 'загружено частично'}</span>
+          <span>{atEnd ? 'конец файла' : eof ? 'конец прочитан' : 'загружено частично'}</span>
+          {notice && <span className="notice">{notice}</span>}
           {busy && <span className="busy">…</span>}
         </footer>
       </main>

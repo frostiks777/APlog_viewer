@@ -23,5 +23,5 @@ export const DEFAULT_PAGE_LINES = 300;
 export const MAX_PAGE_LINES = 2000;
 export const TAIL_INTERVAL_MS = 1500;
 
-/** Открытые файлы держим не дольше этого простоя, чтобы не копить хендлы на шаре. */
-export const HANDLE_IDLE_MS = 5 * 60 * 1000;
+/** Открытые файлы держим не дольше этого простоя: писатель должен мочь ротировать лог. */
+export const HANDLE_IDLE_MS = 60 * 1000;

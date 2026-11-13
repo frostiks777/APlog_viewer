@@ -278,44 +278,44 @@ select {
   left: 0;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 0 12px;
+  padding: 0 12px 0 0;
   white-space: pre;
   font-variant-ligatures: none;
   min-width: 100%;
 }
 
-.ln {
-  flex: 0 0 auto;
-  min-width: 64px;
-  text-align: right;
-  color: #4a5262;
-  font-variant-numeric: tabular-nums;
-  user-select: none;
+/* Линейка слева: точка на каждой строке, крупнее каждые 10, с ореолом каждые 100. */
+.dot {
+  flex: 0 0 26px;
+  width: 26px;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.dot::before {
+  content: '';
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #39404e;
+}
+
+.dot-10::before {
+  width: 4px;
+  height: 4px;
+  background: #5d6678;
+}
+
+.dot-100::before {
+  width: 5px;
+  height: 5px;
+  background: #98a2b6;
+  box-shadow: 0 0 0 2px rgba(152, 162, 182, 0.22);
 }
 
 .text {
   flex: 0 0 auto;
-}
-
-.load-prev {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  display: block;
-  margin: 0 auto;
-  padding: 4px 10px;
-  border: 1px solid var(--border);
-  border-top: none;
-  border-radius: 0 0 6px 6px;
-  background: var(--panel-2);
-  color: var(--text);
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.load-prev:hover {
-  border-color: var(--accent);
 }
 
 .empty {
@@ -338,6 +338,10 @@ select {
 
 .busy {
   color: var(--accent);
+}
+
+.notice {
+  color: #e0a800;
 }
 
 .log,

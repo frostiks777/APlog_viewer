@@ -9,6 +9,36 @@ import { registerRoutes } from './api/routes.js';
 const pool = new LogFilePool(HANDLE_IDLE_MS);
 const app = Fastify({ logger: { level: process.env.APLOG_LOG_LEVEL ?? 'info' } });
 
+/**
+ * Защита локального API от запросов чужих страниц (DNS rebinding / CSRF на localhost).
+ * Токен для одного пользователя ничего не добавляет: процесс того же пользователя
+ * всё равно прочитает профиль. А Host/Origin отсекают именно браузерный вектор.
+ */
+const ALLOWED_HOSTS = new Set([
+  `127.0.0.1:${PORT}`,
+  `localhost:${PORT}`,
+  '127.0.0.1:5173',
+  'localhost:5173',
+]);
+const ALLOWED_ORIGINS = new Set([
+  `http://127.0.0.1:${PORT}`,
+  `http://localhost:${PORT}`,
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
+]);
+
+app.addHook('onRequest', async (request, reply) => {
+  const host = String(request.headers.host ?? '');
+  if (!ALLOWED_HOSTS.has(host)) {
+    return reply.code(403).send({ error: 'Недопустимый Host' });
+  }
+  const origin = request.headers.origin;
+  if (origin && !ALLOWED_ORIGINS.has(origin)) {
+    return reply.code(403).send({ error: 'Недопустимый Origin' });
+  }
+  return undefined;
+});
+
 app.setErrorHandler((error: Error & { statusCode?: number }, _request, reply) => {
   const status = error.statusCode ?? 500;
   if (status >= 500) app.log.error(error);

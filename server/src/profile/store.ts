@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { PROFILE_DIR, PROFILE_FILE } from '../config.js';
@@ -50,7 +50,6 @@ export interface UiState {
   fontSize: number;
   rowHeight: number;
   theme: 'dark' | 'light';
-  showLineNumbers: boolean;
   /** Автозапуск приложения при входе в систему. */
   autostart: boolean;
 }
@@ -149,7 +148,6 @@ export function defaultProfile(): Profile {
       fontSize: 13,
       rowHeight: 20,
       theme: 'dark',
-      showLineNumbers: true,
       autostart: false,
     },
   };
@@ -160,15 +158,19 @@ let writeChain: Promise<void> = Promise.resolve();
 
 export async function loadProfile(): Promise<Profile> {
   if (cache) return cache;
-  try {
-    const raw = await readFile(PROFILE_FILE, 'utf8');
-    const parsed = JSON.parse(raw) as Partial<Profile>;
-    cache = normalizeProfile(parsed);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
-    cache = defaultProfile();
-  }
+
+  const read = async (file: string): Promise<Profile | null> => {
+    try {
+      const raw = await readFile(file, 'utf8');
+      return normalizeProfile(JSON.parse(raw) as Partial<Profile>);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT' || error instanceof SyntaxError) return null;
+      throw error;
+    }
+  };
+
+  cache = (await read(PROFILE_FILE)) ?? (await read(`${PROFILE_FILE}.bak`)) ?? defaultProfile();
   return cache;
 }
 
@@ -179,12 +181,36 @@ export async function saveProfile(next: Profile): Promise<Profile> {
   // полузаписанный профиль при падении или параллельных запросах.
   writeChain = writeChain.then(async () => {
     await mkdir(PROFILE_DIR, { recursive: true });
-    const tmp = `${PROFILE_FILE}.tmp`;
+    // Предыдущая версия остаётся как .bak: битый профиль не должен стирать настройки.
+    await copyFile(PROFILE_FILE, `${PROFILE_FILE}.bak`).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT' && error.code !== 'EPERM' && error.code !== 'EACCES') throw error;
+    });
+    const tmp = `${PROFILE_FILE}.${process.pid}.${Date.now()}.tmp`;
     await writeFile(tmp, `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
-    await rename(tmp, PROFILE_FILE);
+    await replaceFile(tmp, PROFILE_FILE);
   });
   await writeChain;
   return normalized;
+}
+
+/**
+ * Windows иногда отдаёт EPERM/EBUSY на rename поверх существующего файла —
+ * антивирус или индексатор ещё держат хендл. Несколько коротких повторов решают это
+ * без изменения атомарности; прямая перезапись — последний шанс.
+ */
+async function replaceFile(tmp: string, target: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rename(tmp, target);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') throw error;
+      await new Promise((resolve) => setTimeout(resolve, 30 * (attempt + 1)));
+    }
+  }
+  await copyFile(tmp, target);
+  await rm(tmp, { force: true });
 }
 
 export function newId(): string {

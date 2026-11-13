@@ -12,14 +12,32 @@
 
 ## Команды
 
-Стек ещё не выбран: репозиторий содержит только харнесс. Команды установки, dev, сборки и
-тестов появятся после интервью по задаче 2 и фиксируются в `.agents/shared/checks.md`;
-здесь не дублируй их.
+```bash
+npm ci                # установка строго по lock-файлу
+npm run dev           # vite (5173) + fastify (7801) с прокси
+npm run build         # сборка web и server
+npm start             # production: API и статика на 127.0.0.1:7801
+npm run typecheck     # tsc strict для обоих пакетов
+npm run shot          # скриншот UI через headless Edge
+node scripts/check-encodings.mjs   # кодировки и границы строк (нужен запущенный сервер)
+node scripts/check-rotation.mjs    # append/truncate/rotate (нужен запущенный сервер)
+```
+
+Полный чек-чейн — `.agents/shared/checks.md`; здесь не дублируй его.
 
 ## Layout & data flow
 
-Проект пуст, каркас создаётся с нуля. Перед первой правкой читать: этот файл,
-`.agents/shared/checks.md`, `MEMORY.md`, `CONTEXT.md`.
+- `server/src/index.ts` — Fastify, Host/Origin-allowlist, статика, открытие браузера.
+- `server/src/files/reader.ts` — ядро: позиционное чтение окнами, границы строк по
+  кодировке, идентичность `dev:ino`, события ротации/усечения.
+- `server/src/files/encoding.ts` — BOM и автоопределение кодировки.
+- `server/src/api/routes.ts` — REST v1 (вкладки, страницы, tail, last-page, page-before).
+- `server/src/profile/store.ts` — профиль `.aplog/profile.json`, `.bak`, атомарная запись.
+- `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, tail.
+- Поток данных: путь из профиля → `LogFilePool` → `readPage`/`readTail` → JSON → React.
+  Файл целиком в память не читается никогда.
+
+Перед первой правкой читать: этот файл, `.agents/shared/checks.md`, `docs/adr/0001-log-reading-contract.md`.
 
 ## Conventions
 
@@ -107,6 +125,7 @@ scripts/notify.ps1 "Заголовок" "Текст"` (сам файл `scripts/
 
 ## Known baseline
 
-Репозиторий содержит только харнесс и лицензию GPL-3.0: кода, сборки и тестов ещё нет.
-Любая красная проверка после появления кода — регрессия диффа, а не известное исключение.
-Исключения фиксируются здесь вместе с причиной.
+`npm run typecheck`, `npm run build`, `check-encodings` (4/4) и `check-rotation` (4/4)
+зелёные на 2026-11-13. Юнит-фреймворка нет — это осознанно до появления чистой логики,
+которую дешевле покрыть тестами, чем сценарием. Красная проверка после твоего диффа —
+регрессия, а не известное исключение.

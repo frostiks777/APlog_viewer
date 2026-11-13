@@ -13,6 +13,12 @@ export interface LogLine {
   text: string;
 }
 
+/**
+ * Что случилось с файлом между опросами. Нужен tail-клиенту, чтобы не склеивать
+ * строки разных поколений файла после ротации или усечения.
+ */
+export type FileEvent = 'ok' | 'rotated' | 'truncated';
+
 export interface LogPage {
   lines: LogLine[];
   /** Смещение, с которого читается следующая страница. */
@@ -22,6 +28,7 @@ export interface LogPage {
   size: number;
   mtimeMs: number;
   encoding: Encoding;
+  event: FileEvent;
 }
 
 export interface FileIdentity {
@@ -32,17 +39,66 @@ export interface FileIdentity {
   mtimeMs: number;
 }
 
-function lastNewline(buffer: Buffer, from = 0, to = buffer.length): number {
-  for (let i = to - 1; i >= from; i -= 1) {
-    if (buffer[i] === NEWLINE) return i;
-  }
-  return -1;
+function isUtf16(encoding: Encoding): boolean {
+  return encoding === 'utf-16le' || encoding === 'utf-16be';
 }
 
-function countNewlines(buffer: Buffer): number {
-  let count = 0;
-  for (let i = 0; i < buffer.length; i += 1) if (buffer[i] === NEWLINE) count += 1;
-  return count;
+/**
+ * Длина перевода строки, начинающегося в позиции index, или -1.
+ * В UTF-16 перевод строки — двухбайтовая пара, и побайтовый поиск 0x0A её ломает:
+ * остаётся нулевой байт, который попадает в текст следующей строки.
+ */
+function newlineEndAt(buffer: Buffer, index: number, encoding: Encoding): number {
+  if (encoding === 'utf-16le') {
+    return buffer[index] === NEWLINE && buffer[index + 1] === 0x00 ? index + 2 : -1;
+  }
+  if (encoding === 'utf-16be') {
+    return buffer[index] === 0x00 && buffer[index + 1] === NEWLINE ? index + 2 : -1;
+  }
+  return buffer[index] === NEWLINE ? index + 1 : -1;
+}
+
+/** Границы строк (индекс сразу после перевода) в порядке возрастания. */
+function collectLineEnds(buffer: Buffer, encoding: Encoding, maxCount = Number.POSITIVE_INFINITY): number[] {
+  const ends: number[] = [];
+  const last = buffer.length - (isUtf16(encoding) ? 1 : 0);
+  for (let i = 0; i < last; i += 1) {
+    const end = newlineEndAt(buffer, i, encoding);
+    if (end > 0) {
+      ends.push(end);
+      if (ends.length >= maxCount) break;
+    }
+  }
+  return ends;
+}
+
+/** Убирает CR перед переводом строки: в UTF-16 он тоже двухбайтовый. */
+/**
+ * Конец текста строки без перевода строки. end указывает СРАЗУ ПОСЛЕ перевода,
+ * поэтому LF отрезается всегда, а CR — только если он есть (CRLF).
+ */
+function textEndFor(buffer: Buffer, start: number, end: number, encoding: Encoding): number {
+  if (encoding === 'utf-16le') {
+    const hasCr = end - start >= 4 && buffer[end - 4] === CARRIAGE && buffer[end - 3] === 0x00;
+    return hasCr ? end - 4 : end - 2;
+  }
+  if (encoding === 'utf-16be') {
+    const hasCr = end - start >= 4 && buffer[end - 4] === 0x00 && buffer[end - 3] === CARRIAGE;
+    return hasCr ? end - 4 : end - 2;
+  }
+  return end - start >= 2 && buffer[end - 2] === CARRIAGE ? end - 2 : end - 1;
+}
+
+/**
+ * BOM — часть файла, но не часть текста первой строки. Иначе в UI появляется
+ * невидимый \uFEFF в начале лога.
+ */
+function skipBom(buffer: Buffer, start: number, encoding: Encoding): number {
+  if (start !== 0) return 0;
+  if (encoding === 'utf-8' && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return 3;
+  if (encoding === 'utf-16le' && buffer[0] === 0xff && buffer[1] === 0xfe) return 2;
+  if (encoding === 'utf-16be' && buffer[0] === 0xfe && buffer[1] === 0xff) return 2;
+  return 0;
 }
 
 /**
@@ -104,17 +160,16 @@ export class LogFile {
    * stat по SMB стоит десятки-сотни миллисекунд, поэтому для листания страниц он
    * троттлится: цена — устаревший eof на пару секунд, которую тут же исправит следующий stat.
    */
-  async refresh(force = false, minIntervalMs = 2000): Promise<{ rotated: boolean; grown: boolean }> {
+  async refresh(force = false, minIntervalMs = 2000): Promise<FileEvent> {
     const now = Date.now();
-    if (!force && now - this.lastStatMs < minIntervalMs) {
-      return { rotated: false, grown: false };
-    }
+    if (!force && now - this.lastStatMs < minIntervalMs) return 'ok';
     this.lastStatMs = now;
 
+    const previous = this.identity;
     const stats = await stat(this.path, { bigint: true });
     const next = toIdentity(stats);
-    const rotated = next.dev !== this.identity.dev || next.ino !== this.identity.ino;
-    const grown = next.size !== this.identity.size;
+    const rotated = next.dev !== previous.dev || next.ino !== previous.ino;
+    const truncated = !rotated && next.size < previous.size;
 
     if (rotated) {
       await this.handle.close();
@@ -122,7 +177,7 @@ export class LogFile {
       if (!this.encodingLocked) this.encoding = await LogFile.pickEncoding(this.path, next.size);
     }
     this.identity = next;
-    return { rotated, grown };
+    return rotated ? 'rotated' : truncated ? 'truncated' : 'ok';
   }
 
   async identityNow(): Promise<FileIdentity> {
@@ -131,11 +186,13 @@ export class LogFile {
 
   /** Страница строк, начиная со смещения начала строки. */
   async readPage(byteOffset: number, maxLines: number): Promise<LogPage> {
-    await this.refresh(false);
+    const event = await this.refresh(false);
+    return { ...(await this.pageFrom(byteOffset, maxLines)), event };
+  }
+
+  private async pageFrom(byteOffset: number, maxLines: number): Promise<LogPage> {
     const offset = Math.max(0, Math.min(byteOffset, this.identity.size));
-    if (offset >= this.identity.size) {
-      return this.page([], offset, true);
-    }
+    if (offset >= this.identity.size) return this.page([], offset, true);
 
     const chunks: Buffer[] = [];
     let total = 0;
@@ -144,11 +201,7 @@ export class LogFile {
     let complete = false;
 
     while (position < this.identity.size && total < MAX_PAGE_BYTES) {
-      const length = Math.min(
-        READ_CHUNK_BYTES,
-        this.identity.size - position,
-        MAX_PAGE_BYTES - total,
-      );
+      const length = Math.min(READ_CHUNK_BYTES, this.identity.size - position, MAX_PAGE_BYTES - total);
       const buffer = Buffer.allocUnsafe(length);
       const { bytesRead } = await this.handle.read(buffer, 0, length, position);
       if (bytesRead === 0) break;
@@ -158,40 +211,28 @@ export class LogFile {
       total += bytesRead;
       position += bytesRead;
 
-      for (let i = 0; i < chunk.length; i += 1) {
-        if (chunk[i] === NEWLINE) {
-          newlines += 1;
-          if (newlines >= maxLines) {
-            complete = true;
-            break;
-          }
-        }
+      newlines += collectLineEnds(chunk, this.encoding).length;
+      if (newlines >= maxLines) {
+        complete = true;
+        break;
       }
-      if (complete) break;
     }
 
     const buffer = chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, total);
+    const ends = collectLineEnds(buffer, this.encoding, complete ? maxLines : Number.POSITIVE_INFINITY);
+
     let cut = buffer.length;
     let nextOffset = offset + buffer.length;
 
-    if (complete) {
-      let seen = 0;
-      for (let i = 0; i < buffer.length; i += 1) {
-        if (buffer[i] === NEWLINE) {
-          seen += 1;
-          if (seen === maxLines) {
-            cut = i + 1;
-            nextOffset = offset + cut;
-            break;
-          }
-        }
-      }
+    if (complete && ends.length >= maxLines) {
+      cut = ends[maxLines - 1] as number;
+      nextOffset = offset + cut;
     } else if (position < this.identity.size) {
       // Упёрлись в лимит байт: отдаём только полные строки, иначе следующая страница
       // начнётся с середины строки и склеит её дважды.
-      const last = lastNewline(buffer);
-      if (last >= 0) {
-        cut = last + 1;
+      const lastEnd = ends[ends.length - 1];
+      if (lastEnd !== undefined) {
+        cut = lastEnd;
         nextOffset = offset + cut;
       }
     }
@@ -201,38 +242,28 @@ export class LogFile {
   }
 
   /**
-   * Чтение хвоста: только завершённые строки. Неполная последняя строка не отдаётся,
-   * иначе при следующем опросе она придёт второй раз. За один вызов отдаём не больше
-   * maxLines — иначе после простоя клиент получит десятки тысяч строк разом.
+   * Последняя страница файла: открываем лог сразу в конце, как это делает хвостовой
+   * просмотр. Возвращает последние maxLines строк, включая незавершённую последнюю.
    */
-  async readTail(fromOffset: number, maxLines = 2000): Promise<LogPage> {
-    await this.refresh(true);
-    const offset = Math.max(0, Math.min(fromOffset, this.identity.size));
-    if (offset >= this.identity.size) {
-      return this.page([], offset, true);
+  async readLastPage(maxLines: number): Promise<LogPage> {
+    const event = await this.refresh(false);
+    const size = this.identity.size;
+    if (size === 0) return { ...this.page([], 0, true), event };
+
+    const starts: number[] = [];
+    let end = size;
+    while (starts.length <= maxLines && end > 0 && size - end < MAX_PAGE_BYTES) {
+      const start = Math.max(0, end - READ_CHUNK_BYTES);
+      const chunk = await this.readRange(start, end - start);
+      const ends = collectLineEnds(chunk, this.encoding);
+      for (let i = ends.length - 1; i >= 0; i -= 1) starts.push(start + (ends[i] as number));
+      end = start;
     }
 
-    const limited = Math.min(this.identity.size - offset, MAX_PAGE_BYTES);
-    const buffer = Buffer.allocUnsafe(limited);
-    const { bytesRead } = await this.handle.read(buffer, 0, limited, offset);
-    const chunk = buffer.subarray(0, bytesRead);
-
-    let cut = -1;
-    let seen = 0;
-    for (let i = 0; i < chunk.length; i += 1) {
-      if (chunk[i] !== NEWLINE) continue;
-      seen += 1;
-      if (seen >= maxLines) {
-        cut = i + 1;
-        break;
-      }
-    }
-    if (cut < 0) cut = lastNewline(chunk) + 1;
-    if (cut <= 0) return this.page([], offset, true);
-
-    const lines = splitLines(chunk, cut, offset, this.encoding);
-    const endOffset = offset + cut;
-    return this.page(lines, endOffset, endOffset >= this.identity.size);
+    // Позиция size — не начало строки, а «пустая строка» после последнего перевода.
+    const clean = starts.filter((offset) => offset < size).sort((a, b) => a - b);
+    const from = clean.length > maxLines ? (clean[clean.length - maxLines] as number) : 0;
+    return { ...(await this.pageFrom(from, maxLines)), event };
   }
 
   /**
@@ -240,40 +271,66 @@ export class LogFile {
    * затем отдаём ровно те строки, которые ещё не показаны клиенту (offset < byteOffset).
    */
   async pageBefore(byteOffset: number, maxLines: number): Promise<LogPage> {
-    await this.refresh(false);
+    const event = await this.refresh(false);
     const end = Math.max(0, Math.min(byteOffset, this.identity.size));
-    if (end <= 0) return this.page([], 0, false);
+    if (end <= 0) return { ...this.page([], 0, false), event };
 
     let start = Math.max(0, end - READ_CHUNK_BYTES);
     const chunks: Buffer[] = [await this.readRange(start, end - start)];
-    let newlines = countNewlines(chunks[0] as Buffer);
+    let newlines = collectLineEnds(chunks[0] as Buffer, this.encoding).length;
 
     while (newlines <= maxLines && start > 0 && end - start < MAX_PAGE_BYTES) {
       const nextStart = Math.max(0, start - READ_CHUNK_BYTES);
       const chunk = await this.readRange(nextStart, start - nextStart);
       chunks.unshift(chunk);
-      newlines += countNewlines(chunk);
+      newlines += collectLineEnds(chunk, this.encoding).length;
       start = nextStart;
     }
 
     const buffer = chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks);
     const starts: number[] = [];
     if (start === 0) starts.push(0);
-    for (let i = 0; i < buffer.length - 1; i += 1) {
-      if (buffer[i] === NEWLINE) starts.push(start + i + 1);
+    for (const endIndex of collectLineEnds(buffer, this.encoding)) {
+      if (start + endIndex < end) starts.push(start + endIndex);
     }
-    if (starts.length === 0) return this.page([], 0, false);
+    if (starts.length === 0) return { ...this.page([], 0, false), event };
 
     const from = starts.length > maxLines ? (starts[starts.length - maxLines] as number) : (starts[0] as number);
-    const page = await this.readPage(from, maxLines);
+    const page = await this.pageFrom(from, maxLines);
     const lines = page.lines.filter((line) => line.offset < end);
-    return { ...page, lines };
+    return { ...page, lines, event };
   }
 
   private async readRange(position: number, length: number): Promise<Buffer> {
     const buffer = Buffer.allocUnsafe(length);
     const { bytesRead } = await this.handle.read(buffer, 0, length, position);
     return buffer.subarray(0, bytesRead);
+  }
+
+  /**
+   * Чтение хвоста: только завершённые строки. Неполная последняя строка не отдаётся,
+   * иначе при следующем опросе она придёт второй раз. За один вызов отдаём не больше
+   * maxLines — иначе после простоя клиент получит десятки тысяч строк разом.
+   */
+  async readTail(fromOffset: number, maxLines = 2000): Promise<LogPage> {
+    const event = await this.refresh(true);
+    const offset = Math.max(0, Math.min(fromOffset, this.identity.size));
+    if (offset >= this.identity.size) return { ...this.page([], offset, true), event };
+
+    const limited = Math.min(this.identity.size - offset, MAX_PAGE_BYTES);
+    const buffer = Buffer.allocUnsafe(limited);
+    const { bytesRead } = await this.handle.read(buffer, 0, limited, offset);
+    const chunk = buffer.subarray(0, bytesRead);
+    const ends = collectLineEnds(chunk, this.encoding, maxLines);
+
+    let cut = ends[ends.length - 1] ?? -1;
+    if (ends.length < maxLines && cut < 0) return { ...this.page([], offset, true), event };
+    if (ends.length >= maxLines) cut = ends[maxLines - 1] as number;
+    if (cut <= 0) return { ...this.page([], offset, true), event };
+
+    const lines = splitLines(chunk, cut, offset, this.encoding);
+    const endOffset = offset + cut;
+    return { ...this.page(lines, endOffset, endOffset >= this.identity.size), event };
   }
 
   /** Начало предыдущей строки — для прокрутки вверх и поиска назад. */
@@ -286,9 +343,10 @@ export class LogFile {
       const buffer = Buffer.allocUnsafe(span);
       const { bytesRead } = await this.handle.read(buffer, 0, span, start);
       const view = buffer.subarray(0, bytesRead);
-      const idx = lastNewline(view, 0, bytesRead);
-      if (idx >= 0) {
-        const candidate = start + idx + 1;
+      const ends = collectLineEnds(view, this.encoding);
+      const last = ends[ends.length - 1];
+      if (last !== undefined) {
+        const candidate = start + last;
         return candidate < offset ? candidate : Math.max(0, candidate - 1);
       }
       if (start === 0) return 0;
@@ -311,22 +369,27 @@ export class LogFile {
       size: this.identity.size,
       mtimeMs: this.identity.mtimeMs,
       encoding: this.encoding,
+      event: 'ok',
     };
   }
 }
 
 function splitLines(buffer: Buffer, cut: number, baseOffset: number, encoding: Encoding): LogLine[] {
+  const ends = collectLineEnds(buffer.subarray(0, cut), encoding);
   const lines: LogLine[] = [];
   let start = 0;
-  for (let i = 0; i < cut; i += 1) {
-    if (buffer[i] !== NEWLINE) continue;
-    let end = i;
-    if (end > start && buffer[end - 1] === CARRIAGE) end -= 1;
-    lines.push({ offset: baseOffset + start, text: decode(buffer.subarray(start, end), encoding) });
-    start = i + 1;
+  for (const end of ends) {
+    const textEnd = textEndFor(buffer, start, end, encoding);
+    const bom = baseOffset + start === 0 ? skipBom(buffer, start, encoding) : 0;
+    lines.push({
+      offset: baseOffset + start,
+      text: decode(buffer.subarray(start + bom, textEnd), encoding),
+    });
+    start = end;
   }
   if (start < cut) {
-    lines.push({ offset: baseOffset + start, text: decode(buffer.subarray(start, cut), encoding) });
+    const bom = baseOffset + start === 0 ? skipBom(buffer, start, encoding) : 0;
+    lines.push({ offset: baseOffset + start, text: decode(buffer.subarray(start + bom, cut), encoding) });
   }
   return lines;
 }
@@ -343,8 +406,18 @@ function toIdentity(stats: { dev: bigint; ino: bigint; size: bigint; mtimeMs: nu
 /** Кэш открытых файлов: один хендл на путь, закрытие по простою. */
 export class LogFilePool {
   private readonly files = new Map<string, { file: LogFile; usedAt: number }>();
+  /** Последняя известная идентичность по пути — чтобы замечать ротацию между опросами. */
+  private readonly identities = new Map<string, FileIdentity>();
 
   constructor(private readonly idleMs: number) {}
+
+  recallIdentity(path: string): FileIdentity | undefined {
+    return this.identities.get(path);
+  }
+
+  rememberIdentity(path: string, identity: FileIdentity): void {
+    this.identities.set(path, identity);
+  }
 
   async get(path: string, encoding?: Encoding): Promise<LogFile> {
     const cached = this.files.get(path);
@@ -359,18 +432,21 @@ export class LogFilePool {
   }
 
   async closeIdle(now = Date.now()): Promise<void> {
-    const victims: string[] = [];
     for (const [path, entry] of this.files) {
-      if (now - entry.usedAt > this.idleMs) victims.push(path);
+      if (now - entry.usedAt > this.idleMs) await this.release(path);
     }
-    await Promise.all(
-      victims.map(async (path) => {
-        const entry = this.files.get(path);
-        if (!entry) return;
-        this.files.delete(path);
-        await entry.file.close();
-      }),
-    );
+  }
+
+  /**
+   * Закрыть и выкинуть хендл. Нужно для tail: держать файл открытым нельзя —
+   * ночная ротация через rename упадёт у писателя с EPERM, если мы не отпустили файл.
+   */
+  async release(path: string): Promise<void> {
+    const entry = this.files.get(path);
+    if (!entry) return;
+    this.files.delete(path);
+    this.identities.set(path, await entry.file.identityNow());
+    await entry.file.close();
   }
 
   async closeAll(): Promise<void> {

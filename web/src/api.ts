@@ -13,6 +13,7 @@ export interface LogPage {
   size: number;
   mtimeMs: number;
   encoding: string;
+  event: 'ok' | 'rotated' | 'truncated';
 }
 
 export interface TabState {
@@ -67,9 +68,10 @@ export interface Profile {
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
+  const hasBody = init?.body !== undefined;
   const response = await fetch(url, {
     ...init,
-    headers: { 'content-type': 'application/json', ...(init?.headers ?? {}) },
+    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
   });
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { error?: string } | null;
@@ -89,6 +91,8 @@ export const api = {
   activateTab: (id: string) => request<TabState>(`/api/v1/tabs/${id}/activate`, { method: 'POST' }),
   page: (id: string, offset: number, lines: number) =>
     request<LogPage>(`/api/v1/tabs/${id}/page?offset=${offset}&lines=${lines}`),
+  lastPage: (id: string, lines: number) =>
+    request<LogPage>(`/api/v1/tabs/${id}/last-page?lines=${lines}`),
   pageBefore: (id: string, offset: number, lines: number) =>
     request<LogPage>(`/api/v1/tabs/${id}/page-before?offset=${offset}&lines=${lines}`),
   tail: (id: string, offset: number) => request<LogPage>(`/api/v1/tabs/${id}/tail?offset=${offset}`),

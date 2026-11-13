@@ -147,6 +147,16 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
   });
 
+  app.get('/api/v1/tabs/:id/last-page', async (request) => {
+    const { id } = request.params as TabParams;
+    const query = request.query as PageQuery;
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    const file = await pool.get(tab.path, tab.encoding ?? undefined);
+    const page = await file.readLastPage(parseLines(query.lines));
+    return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+  });
+
   app.get('/api/v1/tabs/:id/page-before', async (request) => {
     const { id } = request.params as TabParams;
     const query = request.query as PageQuery;
@@ -163,8 +173,27 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const profile = await loadProfile();
     const tab = findTab(profile, id);
     const file = await pool.get(tab.path, tab.encoding ?? undefined);
-    const page = await file.readTail(parseOffset(query.offset), MAX_PAGE_LINES);
-    return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+    try {
+      const previous = pool.recallIdentity(tab.path);
+      const current = await file.identityNow();
+      // Сравнение с прошлым опросом, а не только с текущим хендлом: tail закрывает файл
+      // после каждого чтения, поэтому «предыдущая» идентичность живёт в пуле.
+      const event =
+        previous && (previous.dev !== current.dev || previous.ino !== current.ino)
+          ? 'rotated'
+          : previous && current.size < previous.size
+            ? 'truncated'
+            : 'ok';
+      // Курсор принадлежит прошлому файлу: после ротации или усечения читаем с начала,
+      // иначе получим обрывок строки из чужого поколения.
+      const requested = parseOffset(query.offset);
+      const from = event === 'ok' ? requested : 0;
+      const page = await file.readTail(from, MAX_PAGE_LINES);
+      return { tabId: tab.id, path: tab.path, title: tab.title, ...page, event };
+    } finally {
+      // Файл отпускаем сразу: иначе ротация лога на шаре не сможет переименовать файл.
+      await pool.release(tab.path);
+    }
   });
 
   app.get('/api/v1/tabs/:id/prev-line', async (request) => {
