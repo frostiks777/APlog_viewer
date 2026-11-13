@@ -66,10 +66,17 @@ export class LogFile {
   }
 
   static async open(path: string, encodingOverride?: Encoding): Promise<LogFile> {
-    const [handle, stats] = await Promise.all([open(path, 'r'), stat(path, { bigint: true })]);
-    const identity = toIdentity(stats);
-    const encoding = encodingOverride ?? (await LogFile.pickEncoding(path, identity.size));
-    return new LogFile(path, handle, identity, encoding, Boolean(encodingOverride));
+    const handle = await open(path, 'r');
+    try {
+      const stats = await stat(path, { bigint: true });
+      const identity = toIdentity(stats);
+      const encoding = encodingOverride ?? (await LogFile.pickEncoding(path, identity.size));
+      return new LogFile(path, handle, identity, encoding, Boolean(encodingOverride));
+    } catch (error) {
+      // Иначе FileHandle станет недостижимым, а Node 26 падает на его сборке мусора.
+      await handle.close().catch(() => undefined);
+      throw error;
+    }
   }
 
   private static async pickEncoding(path: string, size: number): Promise<Encoding> {
@@ -325,6 +332,12 @@ export class LogFilePool {
   private readonly files = new Map<string, { file: LogFile; usedAt: number }>();
   /** Последняя известная идентичность по пути — чтобы замечать ротацию между опросами. */
   private readonly identities = new Map<string, FileIdentity>();
+  /**
+   * Открытия в процессе. Два одновременных запроса к холодному пути не должны открыть
+   * файл дважды: второй результат перезаписал бы первый в кэше, а первый FileHandle
+   * остался бы без close() — Node 26 на этом падает.
+   */
+  private readonly opening = new Map<string, Promise<LogFile>>();
 
   constructor(private readonly idleMs: number) {}
 
@@ -343,9 +356,27 @@ export class LogFilePool {
       cached.usedAt = Date.now();
       return cached.file;
     }
-    const file = await LogFile.open(path, encoding);
-    this.files.set(path, { file, usedAt: Date.now() });
-    return file;
+
+    const pending = this.opening.get(path);
+    if (pending) {
+      const file = await pending;
+      if (encoding && !file.encodingLocked) file.encoding = encoding;
+      const entry = this.files.get(path);
+      if (entry) entry.usedAt = Date.now();
+      return file;
+    }
+
+    const promise = LogFile.open(path, encoding).then((file) => {
+      this.files.set(path, { file, usedAt: Date.now() });
+      return file;
+    });
+    this.opening.set(path, promise);
+    try {
+      return await promise;
+    } finally {
+      // Успех или ошибка — следующий запрос должен начать новое открытие.
+      this.opening.delete(path);
+    }
   }
 
   async closeIdle(now = Date.now()): Promise<void> {

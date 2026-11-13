@@ -123,10 +123,16 @@ export interface SearchParams {
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body !== undefined;
-  const response = await fetch(url, {
-    ...init,
-    headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...init,
+      headers: { ...(hasBody ? { 'content-type': 'application/json' } : {}), ...(init?.headers ?? {}) },
+    });
+  } catch {
+    // Браузерный TypeError «Failed to fetch» — не сообщение для пользователя.
+    throw new Error('Сервер не отвечает — проверьте, запущен ли APlog Viewer');
+  }
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { error?: string } | null;
     throw new Error(body?.error ?? `HTTP ${response.status}`);
