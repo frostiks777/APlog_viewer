@@ -1,0 +1,46 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Модель основного агента. Выбрана владельцем при установке харнесса (2026-11-13).
+  // Бесплатные модели opencode отключаются и блокируются по IP — это регулярное событие,
+  // а не разовая поломка: проверяй доступность командой `opencode run -m <model> "ping"`
+  // и держи запасную модель наготове.
+  "model": "opencode-go/deepseek-v4.1-flash",
+
+  // Модель субагентам здесь НЕ задаётся: без неё они наследуют модель родительской сессии.
+  // Пин вида `provider/model` пережил бы смену провайдера и уронил бы прогон в CI.
+  "agents": {
+    // Исследовательский субагент: только чтение и веб, без edit/shell/subagent,
+    // чтобы разведка не могла случайно что-то изменить.
+    // ВАЖНО: это native V2-форма (`permissions` — массив правил action/resource/effect).
+    // V1-форма `permission: { edit: "deny" }` внутри `agents` в OpenCode v2 молча
+    // отбрасывается: `opencode debug config` показывает `"explore": {}`, и субагент
+    // сохраняет право редактирования. Проверено на v2.2.7.
+    "explore": {
+      "permissions": [
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "skill", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "external_directory", "resource": "*", "effect": "deny" }
+      ]
+    }
+  }
+
+  // MCP-серверы добавляются здесь, когда проекту нужен конкретный сервер, например:
+  //
+  // "mcp": {
+  //   "servers": {
+  //     "my-server": {
+  //       "type": "local",
+  //       "command": ["<команда запуска>", "mcp"]
+  //     }
+  //   }
+  // }
+}
