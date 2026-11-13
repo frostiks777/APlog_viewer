@@ -60,6 +60,11 @@ export interface PanelsState {
   rulesTab: 'highlight' | 'filters';
 }
 
+export interface SearchSettings {
+  isRegex: boolean;
+  caseSensitive: boolean;
+}
+
 export interface UiState {
   fontFamily: string;
   fontSize: number;
@@ -67,6 +72,7 @@ export interface UiState {
   theme: 'dark' | 'light';
   autostart: boolean;
   panels: PanelsState;
+  search: SearchSettings;
 }
 
 export interface Profile {
@@ -81,6 +87,38 @@ export interface Profile {
 export interface RuleIssue {
   id: string;
   message: string;
+}
+
+export interface SearchMatch {
+  offset: number;
+  endOffset: number;
+  text: string;
+}
+
+export type SearchDirection = 'forward' | 'backward';
+
+export interface SearchResult {
+  tabId: string;
+  path: string;
+  title: string;
+  encoding: string;
+  event: 'ok' | 'rotated' | 'truncated';
+  matches: SearchMatch[];
+  /** Начало строки для продолжения в том же направлении. */
+  cursor: number;
+  eof: boolean;
+  scannedBytes: number;
+  size: number;
+  timedOut: boolean;
+}
+
+export interface SearchParams {
+  query: string;
+  isRegex: boolean;
+  caseSensitive: boolean;
+  direction: SearchDirection;
+  fromOffset: number;
+  limit?: number;
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -112,6 +150,11 @@ export const api = {
   pageBefore: (id: string, offset: number, lines: number) =>
     request<LogPage>(`/api/v1/tabs/${id}/page-before?offset=${offset}&lines=${lines}`),
   tail: (id: string, offset: number) => request<LogPage>(`/api/v1/tabs/${id}/tail?offset=${offset}`),
+  search: (id: string, params: SearchParams) =>
+    request<SearchResult>(`/api/v1/tabs/${id}/search`, {
+      method: 'POST',
+      body: JSON.stringify(params),
+    }),
   putRules: (rules: HighlightRule[]) =>
     request<{ rules: HighlightRule[]; issues: RuleIssue[] }>('/api/v1/rules', {
       method: 'PUT',

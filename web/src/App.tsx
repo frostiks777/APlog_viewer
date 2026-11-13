@@ -1,8 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { api, type FilterRule, type HighlightRule, type LogLine, type PanelsState, type Profile, type TabState } from './api';
+import {
+  api,
+  type FilterRule,
+  type HighlightRule,
+  type LogLine,
+  type PanelsState,
+  type Profile,
+  type SearchSettings,
+  type TabState,
+} from './api';
 import RulesPanel, { type PanelTab } from './RulesPanel';
 import { filterAppliesToTab } from './rules/evaluate';
 import { useRulesEngine } from './rules/useRulesEngine';
+import { useFileSearch } from './search/useFileSearch';
 
 const PAGE_LINES = 400;
 const MAX_BUFFERED_LINES = 60_000;
@@ -58,6 +68,10 @@ export default function App() {
   const reloadEndRef = useRef<() => void>(() => undefined);
   const savedSettingsRef = useRef({ rules: '', filters: '' });
   const savedUiRef = useRef('');
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const activeTabRef = useRef<TabState | null>(null);
+  const linesRef = useRef<LogLine[]>([]);
+  const revealedMatchRef = useRef('');
   const stateRef = useRef({ activeId, endOffset, eof, linesLength: 0, tail: false });
   stateRef.current = {
     activeId,
@@ -74,6 +88,13 @@ export default function App() {
     rulesWidth: 360,
     rulesTab: 'highlight',
   };
+  const searchSettings: SearchSettings = profile?.ui.search ?? {
+    isRegex: false,
+    caseSensitive: true,
+  };
+
+  activeTabRef.current = activeTab;
+  linesRef.current = lines;
 
   const applyPage = useCallback((page: Awaited<ReturnType<typeof api.page>>, mode: 'replace' | 'append') => {
     if (mode === 'append' && atBottomRef.current) pendingScrollRef.current = 'end';
@@ -127,6 +148,30 @@ export default function App() {
     } finally {
       loadingRef.current = false;
       setBusy(false);
+    }
+  }, []);
+
+  /**
+   * Переход к совпадению. Если строка уже в буфере, её покажет эффект прокрутки;
+   * иначе грузим страницу ровно с этого смещения — поиск работает по всему файлу.
+   */
+  const revealSearchOffset = useCallback(async (offset: number) => {
+    if (linesRef.current.some((line) => line.offset === offset)) return;
+    const tab = activeTabRef.current;
+    if (!tab) return;
+
+    try {
+      const page = await api.page(tab.id, offset, PAGE_LINES);
+      if (activeTabRef.current?.id !== tab.id) return;
+      setLines(page.lines);
+      setEndOffset(page.endOffset);
+      setEof(page.eof);
+      setFileSize(page.size);
+      setScrollTop(0);
+      setResetToken((token) => token + 1);
+      if (logRef.current) logRef.current.scrollTop = 0;
+    } catch (cause) {
+      setError((cause as Error).message);
     }
   }, []);
 
@@ -383,6 +428,83 @@ export default function App() {
   );
   const anchorOffset = displayLines[anchorIndex]?.offset ?? null;
 
+  const search = useFileSearch({
+    tabId: activeId,
+    anchorOffset: anchorOffset ?? endOffset,
+    isRegex: searchSettings.isRegex,
+    caseSensitive: searchSettings.caseSensitive,
+    onReveal: revealSearchOffset,
+  });
+
+  /**
+   * Строка текущего совпадения видна даже при активном фильтре: иначе переход
+   * к найденной строке заканчивался бы пустым списком.
+   */
+  const renderLines = useMemo(() => {
+    const match = search.match;
+    if (!match) return displayLines;
+    if (displayLines.some((line) => line.offset === match.offset)) return displayLines;
+
+    // Строку ещё не загрузили — не подставляем обрезанный текст из ответа поиска.
+    // После догрузки страницы совпадение появится в displayLines, и эффект прокрутит к нему.
+    const actual = lines.find((line) => line.offset === match.offset);
+    if (!actual) return displayLines;
+
+    let at = displayLines.findIndex((line) => line.offset > match.offset);
+    if (at < 0) at = displayLines.length;
+    return [...displayLines.slice(0, at), actual, ...displayLines.slice(at)];
+  }, [displayLines, lines, search.match]);
+
+  useEffect(() => {
+    const match = search.match;
+    if (!match) return;
+    const index = renderLines.findIndex((line) => line.offset === match.offset);
+    if (index < 0) return;
+
+    const token = `${match.offset}:${search.index}`;
+    if (revealedMatchRef.current === token) return;
+    revealedMatchRef.current = token;
+
+    const element = logRef.current;
+    if (!element) return;
+    // Совпадение — в середину экрана: видно контекст до и после.
+    const top = Math.max(0, index * rowHeight - Math.floor(element.clientHeight / 2) + rowHeight);
+    element.scrollTop = top;
+    setScrollTop(top);
+  }, [renderLines, rowHeight, search.match, search.index]);
+
+  // Новый запрос должен заново центрировать первое совпадение, даже если оно
+  // оказалось тем же смещением, что и в прошлой сессии.
+  useEffect(() => {
+    revealedMatchRef.current = '';
+  }, [activeId, search.query, searchSettings.isRegex, searchSettings.caseSensitive]);
+
+  const searchRef = useRef(search);
+  searchRef.current = search;
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'F3') {
+        event.preventDefault();
+        if (!searchRef.current.query) {
+          searchInputRef.current?.focus();
+          return;
+        }
+        if (event.shiftKey) searchRef.current.prev();
+        else searchRef.current.next();
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'f') {
+        if (!activeTabRef.current) return;
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
   useEffect(() => {
     if (!activeTab || filtersActive || anchorOffset === null) return;
     const timer = window.setTimeout(() => {
@@ -513,6 +635,14 @@ export default function App() {
     );
   };
 
+  const updateSearchSettings = (patch: Partial<SearchSettings>) => {
+    setProfile((current) =>
+      current
+        ? { ...current, ui: { ...current.ui, search: { ...current.ui.search, ...patch } } }
+        : current,
+    );
+  };
+
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 6000);
@@ -520,10 +650,10 @@ export default function App() {
   }, [notice]);
 
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 12);
-  const end = Math.min(displayLines.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 12);
-  const visibleRows = displayLines.slice(start, end);
+  const end = Math.min(renderLines.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 12);
+  const visibleRows = renderLines.slice(start, end);
   const atEnd =
-    eof && displayLines.length > 0 && scrollTop + viewportHeight >= displayLines.length * rowHeight - rowHeight * 2;
+    eof && renderLines.length > 0 && scrollTop + viewportHeight >= renderLines.length * rowHeight - rowHeight * 2;
   const filterLimitReached = filtersActive && lines.length >= FILTER_BUFFER_LIMIT;
 
   return (
@@ -636,12 +766,83 @@ export default function App() {
           )}
         </header>
 
+        {activeTab && (
+          <div className="search-bar">
+            <input
+              ref={searchInputRef}
+              className="search-input"
+              value={search.query}
+              onChange={(event) => search.setQuery(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  if (event.shiftKey) search.prev();
+                  else search.next();
+                } else if (event.key === 'Escape') {
+                  event.preventDefault();
+                  search.clear();
+                  event.currentTarget.blur();
+                }
+              }}
+              placeholder="поиск по файлу…"
+              spellCheck={false}
+              aria-label="Поиск по файлу"
+            />
+            <button
+              className={`chip ${searchSettings.isRegex ? 'chip-on' : ''}`}
+              title="Регулярное выражение"
+              onClick={() => updateSearchSettings({ isRegex: !searchSettings.isRegex })}
+            >
+              .*
+            </button>
+            <button
+              className={`chip ${searchSettings.caseSensitive ? 'chip-on' : ''}`}
+              title="Учитывать регистр"
+              onClick={() => updateSearchSettings({ caseSensitive: !searchSettings.caseSensitive })}
+            >
+              Aa
+            </button>
+            <button
+              className="control"
+              title="Предыдущее совпадение (Shift+F3)"
+              onClick={search.prev}
+              disabled={search.busy || !search.query}
+            >
+              ↑
+            </button>
+            <button
+              className="control"
+              title="Следующее совпадение (F3)"
+              onClick={search.next}
+              disabled={search.busy || !search.query}
+            >
+              ↓
+            </button>
+            <span className="search-count">
+              {search.busy
+                ? 'поиск…'
+                : search.total > 0
+                  ? `${search.index + 1} / ${search.total}${search.complete ? '' : '+'}`
+                  : search.tried && search.complete
+                    ? 'не найдено'
+                    : ''}
+            </span>
+            {search.error && <span className="search-error">{search.error}</span>}
+            {!search.error && search.notice && <span className="muted">{search.notice}</span>}
+            {search.query && (
+              <button className="rule-remove" title="Очистить поиск" onClick={search.clear}>
+                ×
+              </button>
+            )}
+          </div>
+        )}
+
         {error && <div className="error">{error}</div>}
 
         {filtersActive && (
           <div className="filter-bar">
             <span>
-              фильтр: {displayLines.length.toLocaleString('ru-RU')} из{' '}
+              фильтр: {renderLines.length.toLocaleString('ru-RU')} из{' '}
               {lines.length.toLocaleString('ru-RU')} строк буфера
             </span>
             {filterLimitReached && <span className="muted">лимит автодогрузки</span>}
@@ -655,11 +856,11 @@ export default function App() {
         )}
 
         <div className="log" ref={logRef} onScroll={onScroll}>
-          <div className="spacer" style={{ height: displayLines.length * rowHeight }}>
+          <div className="spacer" style={{ height: renderLines.length * rowHeight }}>
             {visibleRows.map((line, index) => (
               <div
                 key={line.offset}
-                className="row"
+                className={`row ${search.match?.offset === line.offset ? 'row-current' : ''}`}
                 style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.offset) }}
               >
                 <span className={dotClass(start + index)} />
@@ -667,7 +868,7 @@ export default function App() {
               </div>
             ))}
           </div>
-          {activeTab && filtersActive && displayLines.length === 0 && (
+          {activeTab && filtersActive && renderLines.length === 0 && (
             <div className="empty">
               Нет совпадений в загруженном буфере
               {lines[0] && lines[0].offset > 0 ? ' — прокрутите вверх или снимите паузу' : ''}
@@ -678,7 +879,7 @@ export default function App() {
 
         <footer className="status">
           <span>строк в буфере: {lines.length.toLocaleString('ru-RU')}</span>
-          {filtersActive && <span>показано: {displayLines.length.toLocaleString('ru-RU')}</span>}
+          {filtersActive && <span>показано: {renderLines.length.toLocaleString('ru-RU')}</span>}
           <span>смещение: {endOffset.toLocaleString('ru-RU')} Б</span>
           <span>{atEnd ? 'конец файла' : eof ? 'конец прочитан' : 'загружено частично'}</span>
           {notice && <span className="notice">{notice}</span>}

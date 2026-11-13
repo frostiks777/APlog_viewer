@@ -1,7 +1,15 @@
 import type { FastifyInstance } from 'fastify';
-import { DEFAULT_PAGE_LINES, MAX_PAGE_LINES } from '../config.js';
+import {
+  DEFAULT_PAGE_LINES,
+  MAX_PAGE_LINES,
+  SEARCH_DEFAULT_MATCHES,
+  SEARCH_MAX_BYTES,
+  SEARCH_MAX_MATCHES,
+} from '../config.js';
 import { isEncoding } from '../files/encoding.js';
 import type { LogFilePool } from '../files/reader.js';
+import { runSearch } from '../search/search.js';
+import type { SearchDirection } from '../search/protocol.js';
 import {
   assertAbsolutePath,
   loadProfile,
@@ -22,6 +30,15 @@ interface TabParams {
 interface PageQuery {
   offset?: string;
   lines?: string;
+}
+
+interface SearchBody {
+  query?: unknown;
+  isRegex?: unknown;
+  caseSensitive?: unknown;
+  direction?: unknown;
+  fromOffset?: unknown;
+  limit?: unknown;
 }
 
 function badRequest(message: string) {
@@ -103,7 +120,12 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const body = (request.body ?? {}) as Partial<UiState>;
     if (typeof body !== 'object' || Array.isArray(body)) throw badRequest('Тело должно быть объектом');
     const profile = await loadProfile();
-    profile.ui = { ...profile.ui, ...body, panels: { ...profile.ui.panels, ...(body.panels ?? {}) } };
+    profile.ui = {
+      ...profile.ui,
+      ...body,
+      panels: { ...profile.ui.panels, ...(body.panels ?? {}) },
+      search: { ...profile.ui.search, ...(body.search ?? {}) },
+    };
     const saved = await saveProfile(profile);
     return saved.ui;
   });
@@ -212,6 +234,64 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const file = await pool.get(tab.path, tab.encoding ?? undefined);
     const page = await file.pageBefore(parseOffset(query.offset), parseLines(query.lines));
     return { tabId: tab.id, path: tab.path, title: tab.title, ...page };
+  });
+
+  app.post('/api/v1/tabs/:id/search', async (request) => {
+    const { id } = request.params as TabParams;
+    const body = (request.body ?? {}) as SearchBody;
+
+    const query = typeof body.query === 'string' ? body.query : '';
+    if (!query) throw badRequest('Введите строку поиска');
+    if (query.length > 500) throw badRequest('Строка поиска длиннее 500 символов');
+
+    const isRegex = Boolean(body.isRegex);
+    const caseSensitive = body.caseSensitive !== false;
+    if (isRegex) {
+      try {
+        new RegExp(query);
+      } catch (error) {
+        throw badRequest(`Ошибка в выражении: ${(error as Error).message}`);
+      }
+    }
+
+    const fromRaw = Number(body.fromOffset ?? 0);
+    if (!Number.isFinite(fromRaw) || fromRaw < 0) {
+      throw badRequest('fromOffset должен быть неотрицательным числом');
+    }
+    const limitRaw = Number(body.limit ?? SEARCH_DEFAULT_MATCHES);
+    const limit = Number.isFinite(limitRaw)
+      ? Math.min(SEARCH_MAX_MATCHES, Math.max(1, Math.floor(limitRaw)))
+      : SEARCH_DEFAULT_MATCHES;
+
+    const profile = await loadProfile();
+    const tab = findTab(profile, id);
+    const file = await pool.get(tab.path, tab.encoding ?? undefined);
+    // Принудительный stat: поиск должен видеть актуальный размер и кодировку,
+    // а не закешированные с прошлой страницы.
+    const event = await file.refresh(true);
+
+    const result = await runSearch({
+      path: tab.path,
+      encoding: file.encoding,
+      size: file.size,
+      query,
+      isRegex,
+      caseSensitive,
+      direction: (body.direction === 'backward' ? 'backward' : 'forward') as SearchDirection,
+      fromOffset: Math.floor(fromRaw),
+      limit,
+      maxBytes: SEARCH_MAX_BYTES,
+    });
+    if (result.error) throw Object.assign(new Error(result.error), { statusCode: 500 });
+
+    return {
+      tabId: tab.id,
+      path: tab.path,
+      title: tab.title,
+      encoding: file.encoding,
+      event,
+      ...result,
+    };
   });
 
   app.get('/api/v1/tabs/:id/tail', async (request) => {

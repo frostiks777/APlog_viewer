@@ -1,9 +1,8 @@
 import { open, stat, type FileHandle } from 'node:fs/promises';
-import { decode, detectEncoding, encodingByExtension, type Encoding } from './encoding.js';
+import { detectEncoding, encodingByExtension, type Encoding } from './encoding.js';
+import { collectLineEnds, decodeLines } from './lines.js';
 import { MAX_PAGE_BYTES, READ_CHUNK_BYTES } from '../config.js';
 
-const NEWLINE = 0x0a;
-const CARRIAGE = 0x0d;
 const PREV_LINE_WINDOW = 64 * 1024;
 const PREV_LINE_MAX_WINDOWS = 64;
 
@@ -37,68 +36,6 @@ export interface FileIdentity {
   ino: string;
   size: number;
   mtimeMs: number;
-}
-
-function isUtf16(encoding: Encoding): boolean {
-  return encoding === 'utf-16le' || encoding === 'utf-16be';
-}
-
-/**
- * Длина перевода строки, начинающегося в позиции index, или -1.
- * В UTF-16 перевод строки — двухбайтовая пара, и побайтовый поиск 0x0A её ломает:
- * остаётся нулевой байт, который попадает в текст следующей строки.
- */
-function newlineEndAt(buffer: Buffer, index: number, encoding: Encoding): number {
-  if (encoding === 'utf-16le') {
-    return buffer[index] === NEWLINE && buffer[index + 1] === 0x00 ? index + 2 : -1;
-  }
-  if (encoding === 'utf-16be') {
-    return buffer[index] === 0x00 && buffer[index + 1] === NEWLINE ? index + 2 : -1;
-  }
-  return buffer[index] === NEWLINE ? index + 1 : -1;
-}
-
-/** Границы строк (индекс сразу после перевода) в порядке возрастания. */
-function collectLineEnds(buffer: Buffer, encoding: Encoding, maxCount = Number.POSITIVE_INFINITY): number[] {
-  const ends: number[] = [];
-  const last = buffer.length - (isUtf16(encoding) ? 1 : 0);
-  for (let i = 0; i < last; i += 1) {
-    const end = newlineEndAt(buffer, i, encoding);
-    if (end > 0) {
-      ends.push(end);
-      if (ends.length >= maxCount) break;
-    }
-  }
-  return ends;
-}
-
-/** Убирает CR перед переводом строки: в UTF-16 он тоже двухбайтовый. */
-/**
- * Конец текста строки без перевода строки. end указывает СРАЗУ ПОСЛЕ перевода,
- * поэтому LF отрезается всегда, а CR — только если он есть (CRLF).
- */
-function textEndFor(buffer: Buffer, start: number, end: number, encoding: Encoding): number {
-  if (encoding === 'utf-16le') {
-    const hasCr = end - start >= 4 && buffer[end - 4] === CARRIAGE && buffer[end - 3] === 0x00;
-    return hasCr ? end - 4 : end - 2;
-  }
-  if (encoding === 'utf-16be') {
-    const hasCr = end - start >= 4 && buffer[end - 4] === 0x00 && buffer[end - 3] === CARRIAGE;
-    return hasCr ? end - 4 : end - 2;
-  }
-  return end - start >= 2 && buffer[end - 2] === CARRIAGE ? end - 2 : end - 1;
-}
-
-/**
- * BOM — часть файла, но не часть текста первой строки. Иначе в UI появляется
- * невидимый \uFEFF в начале лога.
- */
-function skipBom(buffer: Buffer, start: number, encoding: Encoding): number {
-  if (start !== 0) return 0;
-  if (encoding === 'utf-8' && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf) return 3;
-  if (encoding === 'utf-16le' && buffer[0] === 0xff && buffer[1] === 0xfe) return 2;
-  if (encoding === 'utf-16be' && buffer[0] === 0xfe && buffer[1] === 0xff) return 2;
-  return 0;
 }
 
 /**
@@ -237,7 +174,7 @@ export class LogFile {
       }
     }
 
-    const lines = splitLines(buffer, cut, offset, this.encoding);
+    const lines = decodeLines(buffer, cut, offset, this.encoding);
     return this.page(lines, nextOffset, nextOffset >= this.identity.size);
   }
 
@@ -328,7 +265,7 @@ export class LogFile {
     if (ends.length >= maxLines) cut = ends[maxLines - 1] as number;
     if (cut <= 0) return { ...this.page([], offset, true), event };
 
-    const lines = splitLines(chunk, cut, offset, this.encoding);
+    const lines = decodeLines(chunk, cut, offset, this.encoding);
     const endOffset = offset + cut;
     return { ...this.page(lines, endOffset, endOffset >= this.identity.size), event };
   }
@@ -372,26 +309,6 @@ export class LogFile {
       event: 'ok',
     };
   }
-}
-
-function splitLines(buffer: Buffer, cut: number, baseOffset: number, encoding: Encoding): LogLine[] {
-  const ends = collectLineEnds(buffer.subarray(0, cut), encoding);
-  const lines: LogLine[] = [];
-  let start = 0;
-  for (const end of ends) {
-    const textEnd = textEndFor(buffer, start, end, encoding);
-    const bom = baseOffset + start === 0 ? skipBom(buffer, start, encoding) : 0;
-    lines.push({
-      offset: baseOffset + start,
-      text: decode(buffer.subarray(start + bom, textEnd), encoding),
-    });
-    start = end;
-  }
-  if (start < cut) {
-    const bom = baseOffset + start === 0 ? skipBom(buffer, start, encoding) : 0;
-    lines.push({ offset: baseOffset + start, text: decode(buffer.subarray(start + bom, cut), encoding) });
-  }
-  return lines;
 }
 
 function toIdentity(stats: { dev: bigint; ino: bigint; size: bigint; mtimeMs: number | bigint }): FileIdentity {

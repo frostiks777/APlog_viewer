@@ -25,3 +25,13 @@ export const TAIL_INTERVAL_MS = 1500;
 
 /** Открытые файлы держим не дольше этого простоя: писатель должен мочь ротировать лог. */
 export const HANDLE_IDLE_MS = 60 * 1000;
+
+/**
+ * Поиск: за один запрос просматриваем не больше 16 МБ и отдаём до 200 совпадений.
+ * Курсор в ответе позволяет продолжить с того места, поэтому лимит не теряет данные.
+ */
+export const SEARCH_MAX_BYTES = 16 * 1024 * 1024;
+export const SEARCH_DEFAULT_MATCHES = 200;
+export const SEARCH_MAX_MATCHES = 500;
+/** Бюджет воркера: дольше держать поток с потенциально зависшим regex нельзя. */
+export const SEARCH_TIMEOUT_MS = 5000;

@@ -22,6 +22,8 @@ npm run shot          # скриншот UI через headless Edge
 node scripts/check-encodings.mjs   # кодировки и границы строк (нужен запущенный сервер)
 node scripts/check-rotation.mjs    # append/truncate/rotate (нужен запущенный сервер)
 node scripts/check-rules.mjs       # правила и фильтры (см. .agents/shared/checks.md)
+node scripts/check-search.mjs      # поиск по файлу через API
+node scripts/check-search-ui.mjs   # поиск по файлу в браузере (headless Edge)
 ```
 
 Полный чек-чейн — `.agents/shared/checks.md`; здесь не дублируй его.
@@ -32,11 +34,14 @@ node scripts/check-rules.mjs       # правила и фильтры (см. .ag
 - `server/src/files/reader.ts` — ядро: позиционное чтение окнами, границы строк по
   кодировке, идентичность `dev:ino`, события ротации/усечения.
 - `server/src/files/encoding.ts` — BOM и автоопределение кодировки.
-- `server/src/api/routes.ts` — REST v1 (вкладки, страницы, tail, last-page, page-before).
+- `server/src/files/lines.ts` — общий разбор строк: CRLF, UTF-16, границы и BOM.
+- `server/src/search/` — поиск по всему файлу в worker-потоке: курсоры, бюджет 5 с.
+- `server/src/api/routes.ts` — REST v1 (вкладки, страницы, поиск, tail, last-page, page-before).
 - `server/src/profile/store.ts` — профиль `.aplog/profile.json`, `.bak`, атомарная запись.
-- `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, tail.
+- `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, поиск, tail.
 - `web/src/RulesPanel.tsx` — выдвижная панель правил подсветки и фильтров.
 - `web/src/rules/` — компиляция правил, матчинг в Web Worker с бюджетом времени, кэш стилей.
+- `web/src/search/useFileSearch.ts` — сессия поиска: кэш совпадений, `F3`/`Shift+F3`, переходы.
 - Поток данных: путь из профиля → `LogFilePool` → `readPage`/`readTail` → JSON → React.
   Файл целиком в память не читается никогда.
 
@@ -130,6 +135,7 @@ scripts/notify.ps1 "Заголовок" "Текст"` (сам файл `scripts/
 
 `npm run typecheck`, `npm run build`, `check-encodings` (4/4), `check-rotation` (4/4),
 `check-rules-semantics` (16/16), `check-rules` (14/14), `check-rules-timeout` (4/4),
-`check-filter` (3/3) и `check-panel` (5/5) зелёные на 2026-11-13. Юнит-фреймворка нет — это
-осознанно до появления чистой логики, которую дешевле покрыть тестами, чем сценарием.
-Красная проверка после твоего диффа — регрессия, а не известное исключение.
+`check-filter` (3/3), `check-panel` (5/5), `check-search` (22/22) и `check-search-ui` (9/9)
+зелёные на 2026-11-13. Юнит-фреймворка нет — это осознанно до появления чистой логики,
+которую дешевле покрыть тестами, чем сценарием. Красная проверка после твоего диффа —
+регрессия, а не известное исключение.

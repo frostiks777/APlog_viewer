@@ -59,6 +59,12 @@ export interface PanelsState {
   rulesTab: 'highlight' | 'filters';
 }
 
+/** Настройки поиска, которые переживают перезапуск: сам запрос не сохраняем. */
+export interface SearchSettings {
+  isRegex: boolean;
+  caseSensitive: boolean;
+}
+
 export interface UiState {
   fontFamily: string;
   fontSize: number;
@@ -67,6 +73,7 @@ export interface UiState {
   /** Автозапуск приложения при входе в систему. */
   autostart: boolean;
   panels: PanelsState;
+  search: SearchSettings;
 }
 
 export interface Profile {
@@ -165,6 +172,7 @@ export function defaultProfile(): Profile {
       theme: 'dark',
       autostart: false,
       panels: { rulesOpen: false, rulesWidth: 360, rulesTab: 'highlight' },
+      search: { isRegex: false, caseSensitive: true },
     },
   };
 }
@@ -268,6 +276,7 @@ function normalizeProfile(input: Partial<Profile>): Profile {
   const filters = normalizeFilters(input.filters);
 
   const inputUi = (input.ui ?? {}) as Partial<UiState>;
+  const inputSearch = (inputUi.search ?? {}) as Partial<SearchSettings>;
   const ui: UiState = {
     // Поля перечисляем явно: спред сохранял бы в профиль ключи, которых больше нет в схеме
     // (например, showLineNumbers из первой версии).
@@ -277,6 +286,10 @@ function normalizeProfile(input: Partial<Profile>): Profile {
     theme: inputUi.theme === 'light' ? 'light' : 'dark',
     autostart: Boolean(inputUi.autostart),
     panels: { ...base.ui.panels, ...(inputUi.panels ?? {}) },
+    search: {
+      isRegex: Boolean(inputSearch.isRegex),
+      caseSensitive: inputSearch.caseSensitive !== false,
+    },
   };
   ui.panels.rulesOpen = Boolean(ui.panels.rulesOpen);
   ui.panels.rulesWidth = clampNumber(ui.panels.rulesWidth, 300, 640, base.ui.panels.rulesWidth);
