@@ -13,6 +13,7 @@ import RulesPanel, { type PanelTab } from './RulesPanel';
 import { filterAppliesToTab } from './rules/evaluate';
 import { useRulesEngine } from './rules/useRulesEngine';
 import { useFileSearch } from './search/useFileSearch';
+import { useSearchHits } from './search/useSearchHits';
 
 const PAGE_LINES = 400;
 const MAX_BUFFERED_LINES = 60_000;
@@ -436,6 +437,14 @@ export default function App() {
     onReveal: revealSearchOffset,
   });
 
+  const searchHits = useSearchHits({
+    tabId: activeId,
+    query: search.query,
+    isRegex: search.isRegex,
+    caseSensitive: search.caseSensitive,
+    lines,
+  });
+
   /**
    * Строка текущего совпадения видна даже при активном фильтре: иначе переход
    * к найденной строке заканчивался бы пустым списком.
@@ -829,6 +838,9 @@ export default function App() {
             </span>
             {search.error && <span className="search-error">{search.error}</span>}
             {!search.error && search.notice && <span className="muted">{search.notice}</span>}
+            {!search.error && searchHits.timedOut && (
+              <span className="muted">подсветка совпадений отключена — измените запрос</span>
+            )}
             {search.query && (
               <button className="rule-remove" title="Очистить поиск" onClick={search.clear}>
                 ×
@@ -860,7 +872,9 @@ export default function App() {
             {visibleRows.map((line, index) => (
               <div
                 key={line.offset}
-                className={`row ${search.match?.offset === line.offset ? 'row-current' : ''}`}
+                className={`row ${searchHits.hits?.has(line.offset) ? 'row-hit' : ''} ${
+                  search.match?.offset === line.offset ? 'row-current' : ''
+                }`}
                 style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.offset) }}
               >
                 <span className={dotClass(start + index)} />

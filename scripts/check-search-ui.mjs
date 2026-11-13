@@ -76,12 +76,31 @@ try {
 
   await page.click('.search-input');
   await page.type('.search-input', 'ERROR');
+  check(
+    'запрос попал в поле поиска',
+    (await page.$eval('.search-input', (el) => el.value)) === 'ERROR',
+    await page.$eval('.search-input', (el) => el.value),
+  );
   await page.keyboard.press('Enter');
 
-  await page.waitForFunction(
-    () => document.querySelector('.row-current')?.textContent?.includes('line 10') ?? false,
-    { timeout: 15000 },
-  );
+  try {
+    await page.waitForFunction(
+      () => document.querySelector('.row-current')?.textContent?.includes('line 10') ?? false,
+      { timeout: 15000 },
+    );
+  } catch (error) {
+    const state = await page.evaluate(() => ({
+      input: document.querySelector('.search-input')?.value,
+      count: document.querySelector('.search-count')?.textContent,
+      error: document.querySelector('.search-error')?.textContent,
+      notices: [...document.querySelectorAll('.search-bar .muted')].map((el) => el.textContent),
+      first: document.querySelector('.row')?.textContent,
+      current: document.querySelector('.row-current')?.textContent,
+      rows: document.querySelectorAll('.row').length,
+    }));
+    console.log('STATE-AFTER-ENTER', JSON.stringify(state));
+    throw error;
+  }
   check('Enter находит первое совпадение', true);
   check(
     'счётчик показывает позицию и число',

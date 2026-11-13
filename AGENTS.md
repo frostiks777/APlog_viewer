@@ -24,6 +24,8 @@ node scripts/check-rotation.mjs    # append/truncate/rotate (нужен запу
 node scripts/check-rules.mjs       # правила и фильтры (см. .agents/shared/checks.md)
 node scripts/check-search.mjs      # поиск по файлу через API
 node scripts/check-search-ui.mjs   # поиск по файлу в браузере (headless Edge)
+node scripts/check-search-hits.mjs # подсветка всех совпадений (headless Edge)
+node --expose-gc scripts/check-pool.mjs  # пул файлов, сервер не нужен
 ```
 
 Полный чек-чейн — `.agents/shared/checks.md`; здесь не дублируй его.
@@ -41,7 +43,7 @@ node scripts/check-search-ui.mjs   # поиск по файлу в браузе�
 - `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, поиск, tail.
 - `web/src/RulesPanel.tsx` — выдвижная панель правил подсветки и фильтров.
 - `web/src/rules/` — компиляция правил, матчинг в Web Worker с бюджетом времени, кэш стилей.
-- `web/src/search/useFileSearch.ts` — сессия поиска: кэш совпадений, `F3`/`Shift+F3`, переходы.
+- `web/src/search/` — сессия поиска и отдельный воркер подсветки всех совпадений.
 - Поток данных: путь из профиля → `LogFilePool` → `readPage`/`readTail` → JSON → React.
   Файл целиком в память не читается никогда.
 
@@ -135,7 +137,7 @@ scripts/notify.ps1 "Заголовок" "Текст"` (сам файл `scripts/
 
 `npm run typecheck`, `npm run build`, `check-encodings` (4/4), `check-rotation` (4/4),
 `check-rules-semantics` (16/16), `check-rules` (14/14), `check-rules-timeout` (4/4),
-`check-filter` (3/3), `check-panel` (5/5), `check-search` (22/22) и `check-search-ui` (9/9)
-зелёные на 2026-11-13. Юнит-фреймворка нет — это осознанно до появления чистой логики,
-которую дешевле покрыть тестами, чем сценарием. Красная проверка после твоего диффа —
-регрессия, а не известное исключение.
+`check-filter` (3/3), `check-panel` (5/5), `check-search` (22/22), `check-search-ui` (9/9),
+`check-search-hits` (12/12) и `check-pool` (5/5) зелёные на 2026-11-13. Юнит-фреймворка нет —
+это осознанно до появления чистой логики, которую дешевле покрыть тестами, чем сценарием.
+Красная проверка после твоего диффа — регрессия, а не известное исключение.
