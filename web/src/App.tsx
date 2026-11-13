@@ -1,30 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, type HighlightRule, type LogLine, type Profile, type TabState } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { api, type FilterRule, type HighlightRule, type LogLine, type PanelsState, type Profile, type TabState } from './api';
+import RulesPanel, { type PanelTab } from './RulesPanel';
+import { filterAppliesToTab } from './rules/evaluate';
+import { useRulesEngine } from './rules/useRulesEngine';
 
 const PAGE_LINES = 400;
 const MAX_BUFFERED_LINES = 60_000;
+/** Сколько строк максимум просматривает автофильтр, прежде чем попросить «продолжить». */
+const FILTER_BUFFER_LIMIT = 20_000;
 const ENCODINGS = ['utf-8', 'cp1251', 'cp866', 'utf-16le', 'utf-16be', 'latin1'] as const;
-
-interface DisplayLine extends LogLine {
-  /** Порядковый номер строки в буфере — только для «линейки» слева, не номер в файле. */
-  seq: number;
-}
-
-type Matcher = (text: string) => boolean;
-
-function ruleMatcher(rule: HighlightRule): Matcher | null {
-  try {
-    if (rule.isRegex) {
-      const re = new RegExp(rule.match, rule.caseSensitive ? '' : 'i');
-      return (text) => re.test(text);
-    }
-    if (!rule.match) return null;
-    const needle = rule.caseSensitive ? rule.match : rule.match.toLowerCase();
-    return rule.caseSensitive ? (text) => text.includes(needle) : (text) => text.toLowerCase().includes(needle);
-  } catch {
-    return null;
-  }
-}
 
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} Б`;
@@ -38,21 +22,21 @@ function formatSize(bytes: number): string {
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
 }
 
-/** Отрицательные seq тоже должны давать ровный шаг «каждые 10/100». */
+/** Отрицательные индексы тоже должны давать ровный шаг «каждые 10/100». */
 function isMultiple(value: number, step: number): boolean {
   return ((value % step) + step) % step === 0;
 }
 
-function dotClass(seq: number): string {
-  if (isMultiple(seq, 100)) return 'dot dot-100';
-  if (isMultiple(seq, 10)) return 'dot dot-10';
+function dotClass(position: number): string {
+  if (isMultiple(position, 100)) return 'dot dot-100';
+  if (isMultiple(position, 10)) return 'dot dot-10';
   return 'dot';
 }
 
 export default function App() {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [lines, setLines] = useState<DisplayLine[]>([]);
+  const [lines, setLines] = useState<LogLine[]>([]);
   const [endOffset, setEndOffset] = useState(0);
   const [eof, setEof] = useState(true);
   const [fileSize, setFileSize] = useState(0);
@@ -62,12 +46,18 @@ export default function App() {
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(600);
   const [notice, setNotice] = useState<string | null>(null);
+  const [filterPaused, setFilterPaused] = useState(false);
+  const [resetToken, setResetToken] = useState(0);
+  const [saving, setSaving] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [savingError, setSavingError] = useState<string | null>(null);
 
   const logRef = useRef<HTMLDivElement>(null);
   const loadingRef = useRef(false);
   const pendingScrollRef = useRef<'end' | null>(null);
   const atBottomRef = useRef(true);
   const reloadEndRef = useRef<() => void>(() => undefined);
+  const savedSettingsRef = useRef({ rules: '', filters: '' });
+  const savedUiRef = useRef('');
   const stateRef = useRef({ activeId, endOffset, eof, linesLength: 0, tail: false });
   stateRef.current = {
     activeId,
@@ -79,13 +69,17 @@ export default function App() {
 
   const activeTab = profile?.tabs.find((tab) => tab.id === activeId) ?? null;
   const rowHeight = profile?.ui.rowHeight ?? 20;
+  const panels: PanelsState = profile?.ui.panels ?? {
+    rulesOpen: false,
+    rulesWidth: 360,
+    rulesTab: 'highlight',
+  };
 
   const applyPage = useCallback((page: Awaited<ReturnType<typeof api.page>>, mode: 'replace' | 'append') => {
     if (mode === 'append' && atBottomRef.current) pendingScrollRef.current = 'end';
     setLines((current) => {
-      if (mode === 'replace') return page.lines.map((line, index) => ({ ...line, seq: index }));
-      const base = (current[current.length - 1]?.seq ?? -1) + 1;
-      const next = [...current, ...page.lines.map((line, index) => ({ ...line, seq: base + index }))];
+      if (mode === 'replace') return page.lines;
+      const next = [...current, ...page.lines];
       return next.length > MAX_BUFFERED_LINES ? next.slice(next.length - MAX_BUFFERED_LINES) : next;
     });
     setEndOffset(page.endOffset);
@@ -100,11 +94,12 @@ export default function App() {
     try {
       const page = await api.lastPage(tab.id, PAGE_LINES);
       pendingScrollRef.current = 'end';
-      setLines(page.lines.map((line, index) => ({ ...line, seq: index })));
+      setLines(page.lines);
       setEndOffset(page.endOffset);
       setEof(true);
       setFileSize(page.size);
       setScrollTop(0);
+      setResetToken((token) => token + 1);
       if (logRef.current) logRef.current.scrollTop = 0;
     } catch (cause) {
       setError((cause as Error).message);
@@ -120,11 +115,12 @@ export default function App() {
     setError(null);
     try {
       const page = await api.page(tab.id, offset, PAGE_LINES);
-      setLines(page.lines.map((line, index) => ({ ...line, seq: index })));
+      setLines(page.lines);
       setEndOffset(page.endOffset);
       setEof(page.eof);
       setFileSize(page.size);
       setScrollTop(0);
+      setResetToken((token) => token + 1);
       if (logRef.current) logRef.current.scrollTop = 0;
     } catch (cause) {
       setError((cause as Error).message);
@@ -139,6 +135,11 @@ export default function App() {
       try {
         const loaded = await api.profile();
         setProfile(loaded);
+        savedSettingsRef.current = {
+          rules: JSON.stringify(loaded.rules),
+          filters: JSON.stringify(loaded.filters),
+        };
+        savedUiRef.current = JSON.stringify(loaded.ui);
         const first = loaded.tabs.find((tab) => tab.id === loaded.activeTabId) ?? loaded.tabs[0] ?? null;
         if (!first) return;
         setActiveId(first.id);
@@ -195,32 +196,54 @@ export default function App() {
     }
   }, [activeId, applyPage, endOffset, eof]);
 
-  const loadPrevious = useCallback(async () => {
-    if (!activeId || loadingRef.current) return;
-    const first = lines[0];
-    if (!first || first.offset === 0) return;
-    loadingRef.current = true;
-    setBusy(true);
-    try {
-      const page = await api.pageBefore(activeId, first.offset, PAGE_LINES);
-      if (page.lines.length > 0) {
-        setLines((current) => [
-          ...page.lines.map((line, index) => ({ ...line, seq: first.seq - page.lines.length + index })),
-          ...current,
-        ]);
-        const element = logRef.current;
-        if (element) {
-          element.scrollTop += page.lines.length * rowHeight;
-          setScrollTop(element.scrollTop);
+  const filters = profile?.filters ?? [];
+  const rules = profile?.rules ?? [];
+
+  const filtersActive = useMemo(
+    () =>
+      filters.some(
+        (rule) =>
+          rule.enabled && rule.disabledReason !== 'timeout' && filterAppliesToTab(rule, activeId),
+      ),
+    [filters, activeId],
+  );
+
+  const filtersActiveRef = useRef(filtersActive);
+  filtersActiveRef.current = filtersActive;
+
+  /**
+   * `auto` — догрузка автофильтром: не трогаем scrollTop (иначе список прыгает) и не
+   * пишем ошибку сети в шапку. Прокрутку компенсируем только при ручном «выше».
+   */
+  const loadPrevious = useCallback(
+    async (auto = false) => {
+      if (!activeId || loadingRef.current) return;
+      const first = lines[0];
+      if (!first || first.offset === 0) return;
+      if (lines.length >= MAX_BUFFERED_LINES) return;
+      loadingRef.current = true;
+      setBusy(true);
+      try {
+        const page = await api.pageBefore(activeId, first.offset, PAGE_LINES);
+        if (page.lines.length > 0) {
+          setLines((current) => [...page.lines, ...current]);
+          if (!auto && !filtersActiveRef.current) {
+            const element = logRef.current;
+            if (element) {
+              element.scrollTop += page.lines.length * rowHeight;
+              setScrollTop(element.scrollTop);
+            }
+          }
         }
+      } catch (cause) {
+        if (!auto) setError((cause as Error).message);
+      } finally {
+        loadingRef.current = false;
+        setBusy(false);
       }
-    } catch (cause) {
-      setError((cause as Error).message);
-    } finally {
-      loadingRef.current = false;
-      setBusy(false);
-    }
-  }, [activeId, lines, rowHeight]);
+    },
+    [activeId, lines, rowHeight],
+  );
 
   // Хвост: опрос раз в 1.5 с, только когда вкладка в tail-режиме и мы уже в конце файла.
   useEffect(() => {
@@ -259,41 +282,167 @@ export default function App() {
     };
   }, [activeId, activeTab?.tail, applyPage]);
 
+  const markSlowRule = useCallback((ruleId: string) => {
+    setProfile((current) => {
+      if (!current) return current;
+      if (current.rules.some((rule) => rule.id === ruleId)) {
+        return {
+          ...current,
+          rules: current.rules.map((rule) =>
+            rule.id === ruleId ? { ...rule, disabledReason: 'timeout' } : rule,
+          ),
+        };
+      }
+      if (current.filters.some((rule) => rule.id === ruleId)) {
+        return {
+          ...current,
+          filters: current.filters.map((rule) =>
+            rule.id === ruleId ? { ...rule, disabledReason: 'timeout' } : rule,
+          ),
+        };
+      }
+      return current;
+    });
+  }, []);
+
+  const engine = useRulesEngine({
+    enabled: Boolean(activeId),
+    rules,
+    filters,
+    activeTabId: activeId,
+    lines,
+    resetToken,
+    onSlowRule: markSlowRule,
+  });
+
+  const displayLines = useMemo(() => {
+    if (!filtersActive) return lines;
+    const hidden = engine.hidden;
+    if (!hidden) return lines;
+    return lines.filter((line) => !hidden.has(line.offset));
+  }, [filtersActive, engine.hidden, lines]);
+
+  const rulesById = useMemo(() => new Map(rules.map((rule) => [rule.id, rule])), [rules]);
+
+  const styleFor = useCallback(
+    (offset: number): CSSProperties => {
+      const ruleId = engine.styleOf(offset);
+      if (!ruleId) return {};
+      const rule = rulesById.get(ruleId);
+      if (!rule) return {};
+      const fg = rule.invert ? rule.bg : rule.fg;
+      const bg = rule.invert ? rule.fg : rule.bg;
+      return {
+        color: fg === 'transparent' ? undefined : fg,
+        background: bg === 'transparent' ? undefined : bg,
+        fontWeight: rule.bold ? 600 : undefined,
+      };
+    },
+    [engine.styleOf, rulesById],
+  );
+
   const onScroll = useCallback(() => {
     const element = logRef.current;
     if (!element) return;
     const top = element.scrollTop;
     setScrollTop(top);
     atBottomRef.current = top + element.clientHeight >= element.scrollHeight - 4;
-    if (top + element.clientHeight >= lines.length * rowHeight - rowHeight * 4) void appendNext();
+    if (top + element.clientHeight >= displayLines.length * rowHeight - rowHeight * 4) {
+      void appendNext();
+    }
     if (top < rowHeight * 3) void loadPrevious();
-  }, [appendNext, lines.length, loadPrevious, rowHeight]);
+  }, [appendNext, displayLines.length, loadPrevious, rowHeight]);
 
-  const matchers = useMemo(() => {
-    if (!profile) return [] as Array<{ rule: HighlightRule; test: Matcher }>;
-    return profile.rules
-      .filter((rule) => rule.enabled && (rule.scope === 'global' || rule.tabId === activeId))
-      .sort((a, b) => b.priority - a.priority)
-      .map((rule) => ({ rule, test: ruleMatcher(rule) }))
-      .filter((item): item is { rule: HighlightRule; test: Matcher } => item.test !== null);
-  }, [profile, activeId]);
+  // Автодогрузка под фильтром: поднимаемся вверх, пока совпадений не хватает на экран,
+  // не достигнут лимит буфера или не дошли до начала файла.
+  useEffect(() => {
+    if (!activeId || !filtersActive || filterPaused) return;
+    if (loadingRef.current) return;
+    if (lines.length >= FILTER_BUFFER_LIMIT) return;
+    const first = lines[0];
+    if (!first || first.offset === 0) return;
+    const rowsOnScreen = Math.max(20, Math.ceil(viewportHeight / rowHeight));
+    if (displayLines.length >= rowsOnScreen) return;
+    void loadPrevious(true);
+  }, [
+    activeId,
+    displayLines.length,
+    filterPaused,
+    filtersActive,
+    lines,
+    loadPrevious,
+    rowHeight,
+    viewportHeight,
+  ]);
 
-  const styleFor = useCallback(
-    (text: string): React.CSSProperties => {
-      for (const { rule, test } of matchers) {
-        if (!test(text)) continue;
-        const fg = rule.invert ? rule.bg : rule.fg;
-        const bg = rule.invert ? rule.fg : rule.bg;
-        return {
-          color: fg === 'transparent' ? undefined : fg,
-          background: bg === 'transparent' ? undefined : bg,
-          fontWeight: rule.bold ? 600 : undefined,
-        };
-      }
-      return {};
-    },
-    [matchers],
+  // Позиция чтения — часть рабочего пространства. Привязываемся к первой видимой строке,
+  // а не к началу буфера, и пишем редко: иначе каждое колесо — запись профиля.
+  const anchorIndex = Math.min(
+    Math.max(0, displayLines.length - 1),
+    Math.max(0, Math.floor(scrollTop / rowHeight)),
   );
+  const anchorOffset = displayLines[anchorIndex]?.offset ?? null;
+
+  useEffect(() => {
+    if (!activeTab || filtersActive || anchorOffset === null) return;
+    const timer = window.setTimeout(() => {
+      void api.patchTab(activeTab.id, { scrollOffset: anchorOffset }).catch(() => undefined);
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [activeTab?.id, anchorOffset, filtersActive]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const uiJson = JSON.stringify(profile.ui);
+    if (!savedUiRef.current) {
+      savedUiRef.current = uiJson;
+      return;
+    }
+    if (uiJson === savedUiRef.current) return;
+    const timer = window.setTimeout(() => {
+      savedUiRef.current = uiJson;
+      void api.patchUi(profile.ui).catch(() => undefined);
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [profile?.ui]);
+
+  useEffect(() => {
+    if (!profile) return;
+    const rulesJson = JSON.stringify(profile.rules);
+    const filtersJson = JSON.stringify(profile.filters);
+    const rulesDirty = rulesJson !== savedSettingsRef.current.rules;
+    const filtersDirty = filtersJson !== savedSettingsRef.current.filters;
+    if (!rulesDirty && !filtersDirty) return;
+
+    setSaving('saving');
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          if (rulesDirty) {
+            const result = await api.putRules(profile.rules);
+            savedSettingsRef.current.rules = JSON.stringify(result.rules);
+          }
+          if (filtersDirty) {
+            const result = await api.putFilters(profile.filters);
+            savedSettingsRef.current.filters = JSON.stringify(result.filters);
+          }
+          setSaving('saved');
+          setSavingError(null);
+        } catch (cause) {
+          setSaving('error');
+          setSavingError((cause as Error).message);
+        }
+      })();
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [profile?.rules, profile?.filters]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      '--panel-width',
+      panels.rulesOpen ? `${panels.rulesWidth}px` : '0px',
+    );
+  }, [panels.rulesOpen, panels.rulesWidth]);
 
   const addTab = async () => {
     const path = pathInput.trim();
@@ -331,7 +480,10 @@ export default function App() {
       if (fallback) {
         if (fallback.tail) await loadEnd(fallback);
         else await loadAt(fallback, fallback.scrollOffset);
-      } else setLines([]);
+      } else {
+        setLines([]);
+        setResetToken((token) => token + 1);
+      }
     }
   };
 
@@ -350,6 +502,17 @@ export default function App() {
     if ('encoding' in patch) await loadEnd(updated);
   };
 
+  const updatePanels = (patch: Partial<PanelsState>) => {
+    setProfile((current) =>
+      current
+        ? {
+            ...current,
+            ui: { ...current.ui, panels: { ...current.ui.panels, ...patch } },
+          }
+        : current,
+    );
+  };
+
   useEffect(() => {
     if (!notice) return;
     const timer = window.setTimeout(() => setNotice(null), 6000);
@@ -357,9 +520,11 @@ export default function App() {
   }, [notice]);
 
   const start = Math.max(0, Math.floor(scrollTop / rowHeight) - 12);
-  const end = Math.min(lines.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 12);
-  const visible = lines.slice(start, end);
-  const atEnd = eof && lines.length > 0 && scrollTop + viewportHeight >= lines.length * rowHeight - rowHeight * 2;
+  const end = Math.min(displayLines.length, Math.ceil((scrollTop + viewportHeight) / rowHeight) + 12);
+  const visibleRows = displayLines.slice(start, end);
+  const atEnd =
+    eof && displayLines.length > 0 && scrollTop + viewportHeight >= displayLines.length * rowHeight - rowHeight * 2;
+  const filterLimitReached = filtersActive && lines.length >= FILTER_BUFFER_LIMIT;
 
   return (
     <div className="app">
@@ -459,36 +624,88 @@ export default function App() {
               <button className="control" onClick={() => void loadAt(activeTab, 0)} disabled={busy}>
                 в начало
               </button>
+
+              <button
+                className={`control ${panels.rulesOpen ? 'control-active' : ''}`}
+                onClick={() => updatePanels({ rulesOpen: !panels.rulesOpen })}
+                title="Правила подсветки и фильтры"
+              >
+                правила
+              </button>
             </div>
           )}
         </header>
 
         {error && <div className="error">{error}</div>}
 
+        {filtersActive && (
+          <div className="filter-bar">
+            <span>
+              фильтр: {displayLines.length.toLocaleString('ru-RU')} из{' '}
+              {lines.length.toLocaleString('ru-RU')} строк буфера
+            </span>
+            {filterLimitReached && <span className="muted">лимит автодогрузки</span>}
+            {engine.busy && <span className="busy">…</span>}
+            {(lines[0]?.offset ?? 0) > 0 && lines.length < FILTER_BUFFER_LIMIT && (
+              <button className="control" onClick={() => setFilterPaused((paused) => !paused)}>
+                {filterPaused ? 'продолжить' : 'стоп'}
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="log" ref={logRef} onScroll={onScroll}>
-          <div className="spacer" style={{ height: lines.length * rowHeight }}>
-            {visible.map((line, index) => (
+          <div className="spacer" style={{ height: displayLines.length * rowHeight }}>
+            {visibleRows.map((line, index) => (
               <div
-                key={`${line.offset}-${line.seq}`}
+                key={line.offset}
                 className="row"
-                style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.text) }}
+                style={{ top: (start + index) * rowHeight, height: rowHeight, ...styleFor(line.offset) }}
               >
-                <span className={dotClass(line.seq)} />
+                <span className={dotClass(start + index)} />
                 <span className="text">{line.text || ' '}</span>
               </div>
             ))}
           </div>
+          {activeTab && filtersActive && displayLines.length === 0 && (
+            <div className="empty">
+              Нет совпадений в загруженном буфере
+              {lines[0] && lines[0].offset > 0 ? ' — прокрутите вверх или снимите паузу' : ''}
+            </div>
+          )}
           {!activeTab && <div className="empty">Выберите вкладку или добавьте файл слева</div>}
         </div>
 
         <footer className="status">
           <span>строк в буфере: {lines.length.toLocaleString('ru-RU')}</span>
+          {filtersActive && <span>показано: {displayLines.length.toLocaleString('ru-RU')}</span>}
           <span>смещение: {endOffset.toLocaleString('ru-RU')} Б</span>
           <span>{atEnd ? 'конец файла' : eof ? 'конец прочитан' : 'загружено частично'}</span>
           {notice && <span className="notice">{notice}</span>}
           {busy && <span className="busy">…</span>}
         </footer>
       </main>
+
+      <RulesPanel
+        open={panels.rulesOpen}
+        width={panels.rulesWidth}
+        tab={panels.rulesTab}
+        rules={rules}
+        filters={filters}
+        tabs={profile?.tabs ?? []}
+        activeTabId={activeId}
+        saving={saving}
+        savingError={savingError}
+        onTabChange={(tab: PanelTab) => updatePanels({ rulesTab: tab })}
+        onRulesChange={(next: HighlightRule[]) =>
+          setProfile((current) => (current ? { ...current, rules: next } : current))
+        }
+        onFiltersChange={(next: FilterRule[]) =>
+          setProfile((current) => (current ? { ...current, filters: next } : current))
+        }
+        onWidthChange={(width) => updatePanels({ rulesWidth: Math.round(width) })}
+        onClose={() => updatePanels({ rulesOpen: false })}
+      />
     </div>
   );
 }

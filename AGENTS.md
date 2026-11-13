@@ -21,6 +21,7 @@ npm run typecheck     # tsc strict для обоих пакетов
 npm run shot          # скриншот UI через headless Edge
 node scripts/check-encodings.mjs   # кодировки и границы строк (нужен запущенный сервер)
 node scripts/check-rotation.mjs    # append/truncate/rotate (нужен запущенный сервер)
+node scripts/check-rules.mjs       # правила и фильтры (см. .agents/shared/checks.md)
 ```
 
 Полный чек-чейн — `.agents/shared/checks.md`; здесь не дублируй его.
@@ -34,6 +35,8 @@ node scripts/check-rotation.mjs    # append/truncate/rotate (нужен запу
 - `server/src/api/routes.ts` — REST v1 (вкладки, страницы, tail, last-page, page-before).
 - `server/src/profile/store.ts` — профиль `.aplog/profile.json`, `.bak`, атомарная запись.
 - `web/src/App.tsx` — вкладки, виртуализованный список, линейка-точки, tail.
+- `web/src/RulesPanel.tsx` — выдвижная панель правил подсветки и фильтров.
+- `web/src/rules/` — компиляция правил, матчинг в Web Worker с бюджетом времени, кэш стилей.
 - Поток данных: путь из профиля → `LogFilePool` → `readPage`/`readTail` → JSON → React.
   Файл целиком в память не читается никогда.
 
@@ -125,7 +128,8 @@ scripts/notify.ps1 "Заголовок" "Текст"` (сам файл `scripts/
 
 ## Known baseline
 
-`npm run typecheck`, `npm run build`, `check-encodings` (4/4) и `check-rotation` (4/4)
-зелёные на 2026-11-13. Юнит-фреймворка нет — это осознанно до появления чистой логики,
-которую дешевле покрыть тестами, чем сценарием. Красная проверка после твоего диффа —
-регрессия, а не известное исключение.
+`npm run typecheck`, `npm run build`, `check-encodings` (4/4), `check-rotation` (4/4),
+`check-rules-semantics` (16/16), `check-rules` (14/14), `check-rules-timeout` (4/4),
+`check-filter` (3/3) и `check-panel` (5/5) зелёные на 2026-11-13. Юнит-фреймворка нет — это
+осознанно до появления чистой логики, которую дешевле покрыть тестами, чем сценарием.
+Красная проверка после твоего диффа — регрессия, а не известное исключение.

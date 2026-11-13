@@ -39,6 +39,8 @@ export interface HighlightRule {
   priority: number;
   scope: 'global' | 'tab';
   tabId: string | null;
+  /** Правило не применяется: выражение не уложилось в бюджет времени. */
+  disabledReason?: 'timeout' | null;
 }
 
 export interface FilterRule {
@@ -49,6 +51,22 @@ export interface FilterRule {
   isRegex: boolean;
   caseSensitive: boolean;
   tabId: string | null;
+  disabledReason?: 'timeout' | null;
+}
+
+export interface PanelsState {
+  rulesOpen: boolean;
+  rulesWidth: number;
+  rulesTab: 'highlight' | 'filters';
+}
+
+export interface UiState {
+  fontFamily: string;
+  fontSize: number;
+  rowHeight: number;
+  theme: 'dark' | 'light';
+  autostart: boolean;
+  panels: PanelsState;
 }
 
 export interface Profile {
@@ -57,14 +75,12 @@ export interface Profile {
   activeTabId: string | null;
   rules: HighlightRule[];
   filters: FilterRule[];
-  ui: {
-    fontFamily: string;
-    fontSize: number;
-    rowHeight: number;
-    theme: 'dark' | 'light';
-    showLineNumbers: boolean;
-    autostart: boolean;
-  };
+  ui: UiState;
+}
+
+export interface RuleIssue {
+  id: string;
+  message: string;
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -96,4 +112,16 @@ export const api = {
   pageBefore: (id: string, offset: number, lines: number) =>
     request<LogPage>(`/api/v1/tabs/${id}/page-before?offset=${offset}&lines=${lines}`),
   tail: (id: string, offset: number) => request<LogPage>(`/api/v1/tabs/${id}/tail?offset=${offset}`),
+  putRules: (rules: HighlightRule[]) =>
+    request<{ rules: HighlightRule[]; issues: RuleIssue[] }>('/api/v1/rules', {
+      method: 'PUT',
+      body: JSON.stringify({ rules }),
+    }),
+  putFilters: (filters: FilterRule[]) =>
+    request<{ filters: FilterRule[]; issues: RuleIssue[] }>('/api/v1/filters', {
+      method: 'PUT',
+      body: JSON.stringify({ filters }),
+    }),
+  patchUi: (patch: Partial<UiState>) =>
+    request<UiState>('/api/v1/ui', { method: 'PATCH', body: JSON.stringify(patch) }),
 };

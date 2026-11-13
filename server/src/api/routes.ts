@@ -8,8 +8,11 @@ import {
   newId,
   pathAvailable,
   saveProfile,
+  type FilterRule,
+  type HighlightRule,
   type Profile,
   type TabState,
+  type UiState,
 } from '../profile/store.js';
 
 interface TabParams {
@@ -45,6 +48,23 @@ function findTab(profile: Profile, id: string): TabState {
   return tab;
 }
 
+/**
+ * Синтаксические ошибки regex. Возвращаются списком, а НЕ HTTP-ошибкой: панель сохраняет
+ * правило на каждый ввод, и 400 на середине паттерна означал бы потерю текста.
+ */
+function regexIssues(rules: Array<{ id: string; match: string; isRegex: boolean }>): Array<{ id: string; message: string }> {
+  const issues: Array<{ id: string; message: string }> = [];
+  for (const rule of rules) {
+    if (!rule.isRegex || !rule.match) continue;
+    try {
+      new RegExp(rule.match);
+    } catch (error) {
+      issues.push({ id: rule.id, message: (error as Error).message });
+    }
+  }
+  return issues;
+}
+
 export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): Promise<void> {
   app.get('/api/v1/health', async () => ({
     ok: true,
@@ -59,6 +79,33 @@ export async function registerRoutes(app: FastifyInstance, pool: LogFilePool): P
     const body = request.body as Profile | undefined;
     if (!body || typeof body !== 'object') throw badRequest('Тело профиля должно быть объектом');
     return saveProfile(body);
+  });
+
+  app.put('/api/v1/rules', async (request) => {
+    const body = request.body as { rules?: unknown } | undefined;
+    if (!Array.isArray(body?.rules)) throw badRequest('Ожидается { rules: [...] }');
+    const profile = await loadProfile();
+    profile.rules = body.rules as HighlightRule[];
+    const saved = await saveProfile(profile);
+    return { rules: saved.rules, issues: regexIssues(saved.rules) };
+  });
+
+  app.put('/api/v1/filters', async (request) => {
+    const body = request.body as { filters?: unknown } | undefined;
+    if (!Array.isArray(body?.filters)) throw badRequest('Ожидается { filters: [...] }');
+    const profile = await loadProfile();
+    profile.filters = body.filters as FilterRule[];
+    const saved = await saveProfile(profile);
+    return { filters: saved.filters, issues: regexIssues(saved.filters) };
+  });
+
+  app.patch('/api/v1/ui', async (request) => {
+    const body = (request.body ?? {}) as Partial<UiState>;
+    if (typeof body !== 'object' || Array.isArray(body)) throw badRequest('Тело должно быть объектом');
+    const profile = await loadProfile();
+    profile.ui = { ...profile.ui, ...body, panels: { ...profile.ui.panels, ...(body.panels ?? {}) } };
+    const saved = await saveProfile(profile);
+    return saved.ui;
   });
 
   app.post('/api/v1/tabs', async (request, reply) => {

@@ -30,7 +30,7 @@ body {
 
 .app {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr) var(--panel-width, 0px);
   height: 100%;
 }
 
@@ -220,6 +220,28 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
+}
+
+.control-active {
+  border-color: var(--accent);
+  color: #cfe1ff;
+}
+
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 12px;
+  background: #1a2434;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.filter-bar .control {
+  margin-left: auto;
+  padding: 2px 8px;
 }
 
 .control {
@@ -348,4 +370,280 @@ select {
 .row,
 .text {
   font-family: var(--log-font, Consolas, 'Cascadia Mono', 'Courier New', monospace);
+}
+
+/* Выдвижная панель правил: колонка сетки шириной 0, когда закрыта. */
+.rules-panel {
+  display: none;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+.rules-panel-open {
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 5;
+}
+
+.panel-resizer:hover {
+  background: rgba(76, 141, 255, 0.35);
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px 0 4px;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.panel-tabs {
+  display: flex;
+  gap: 2px;
+}
+
+.panel-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 8px 8px 6px;
+  cursor: pointer;
+}
+
+.panel-tab-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.panel-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+
+.panel-close:hover {
+  color: var(--danger);
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.panel-hint {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.panel-add {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 6px;
+  cursor: pointer;
+}
+
+.panel-add:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.panel-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+
+.saved {
+  color: #7ee787;
+}
+
+.rule {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.rule-off {
+  opacity: 0.55;
+}
+
+.rule-bad {
+  border-color: #7a2f2f;
+}
+
+.rule-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.rule-meta {
+  flex-wrap: wrap;
+  gap: 6px 8px;
+}
+
+.rule-match {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--log-font, Consolas, 'Cascadia Mono', 'Courier New', monospace);
+  font-size: 11px;
+  padding: 4px 6px;
+}
+
+.rule-match:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.chip {
+  min-width: 24px;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.chip-on {
+  background: #24354f;
+  border-color: #33507a;
+  color: #cfe1ff;
+}
+
+.rule-remove {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.rule-remove:hover {
+  color: var(--danger);
+}
+
+.color-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.color-field input[type='color'] {
+  width: 24px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+
+.color-field input[type='color']::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+
+.color-field input[type='color']::-webkit-color-swatch {
+  border: none;
+  border-radius: 2px;
+}
+
+.rule-scope {
+  max-width: 132px;
+  font-size: 10px;
+}
+
+.rule-mode {
+  font-size: 10px;
+}
+
+.rule-order {
+  display: flex;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.rule-order button {
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 10px;
+  padding: 0;
+}
+
+.rule-order button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.rule-issue {
+  color: #ffb4ab;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-family: inherit;
+  font-size: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
 }

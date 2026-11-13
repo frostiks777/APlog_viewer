@@ -45,6 +45,30 @@ node scripts/check-rotation.mjs
 
 Оба возвращают ненулевой код при провале. Ожидаемый результат — 4/4 и 4/4 PASS.
 
+### Правила и фильтры
+
+```bash
+node scripts/check-rules-semantics.mjs   # чистая семантика, сервер не нужен
+node scripts/check-rules.mjs             # API: сохранение, issues, нормализация, панель
+node scripts/check-rules-timeout.mjs     # патологический regex (headless Edge)
+node scripts/check-filter.mjs            # include-фильтр и автодогрузка (headless Edge)
+node scripts/check-panel.mjs             # автосейв из панели и позиция чтения
+```
+
+- `check-rules-semantics.mjs` — приоритет, регистр, битый и пустой паттерн, include/exclude.
+  Единственная проверка, которой не нужен запущенный сервер.
+- `check-rules.mjs` — `PUT /rules` и `PUT /filters` принимают битый regex с `issues`, а не 400;
+  цвета нормализуются; панель в `ui` сохраняется и зажимается по ширине.
+- `check-rules-timeout.mjs` — правило `(a+)+$` убивается по таймауту, помечается
+  `disabledReason: 'timeout'`, остальные правила продолжают красить строки.
+- `check-filter.mjs` — include оставляет только совпадения, буфер сам догружается до начала
+  файла, счётчики в статусе и в полосе фильтра совпадают.
+- `check-panel.mjs` — правило из панели сохраняется автосейвом и переживает перезагрузку;
+  `scrollOffset` пишется и восстанавливается на вкладке без tail.
+
+Скрипты с браузером требуют запущенный сервер и Edge; профиль они меняют временно и
+восстанавливают в `finally`. Если проверка упала посередине, сверь `profile.json`.
+
 ## 5. Визуальная проверка (для UI-изменений)
 
 ```bash

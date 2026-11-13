@@ -21,6 +21,12 @@ export interface HighlightRule {
   /** global — правило профиля, tab — только для одной вкладки. */
   scope: 'global' | 'tab';
   tabId: string | null;
+  /**
+   * Правило включено пользователем, но не применяется: выражение не ответило за бюджет
+   * времени. Признак хранится в профиле, иначе после перезагрузки страница снова
+   * зависла бы на том же паттерне.
+   */
+  disabledReason?: 'timeout' | null;
 }
 
 export type FilterMode = 'include' | 'exclude';
@@ -33,6 +39,7 @@ export interface FilterRule {
   isRegex: boolean;
   caseSensitive: boolean;
   tabId: string | null;
+  disabledReason?: 'timeout' | null;
 }
 
 export interface TabState {
@@ -45,6 +52,13 @@ export interface TabState {
   scrollOffset: number;
 }
 
+export interface PanelsState {
+  rulesOpen: boolean;
+  /** Ширина выдвижной панели в пикселях. */
+  rulesWidth: number;
+  rulesTab: 'highlight' | 'filters';
+}
+
 export interface UiState {
   fontFamily: string;
   fontSize: number;
@@ -52,6 +66,7 @@ export interface UiState {
   theme: 'dark' | 'light';
   /** Автозапуск приложения при входе в систему. */
   autostart: boolean;
+  panels: PanelsState;
 }
 
 export interface Profile {
@@ -149,6 +164,7 @@ export function defaultProfile(): Profile {
       rowHeight: 20,
       theme: 'dark',
       autostart: false,
+      panels: { rulesOpen: false, rulesWidth: 360, rulesTab: 'highlight' },
     },
   };
 }
@@ -248,36 +264,23 @@ function normalizeProfile(input: Partial<Profile>): Profile {
         }))
     : [];
 
-  const rules = Array.isArray(input.rules)
-    ? input.rules
-        .filter((rule): rule is HighlightRule => Boolean(rule) && typeof (rule as HighlightRule).match === 'string')
-        .map((rule) => ({ ...base.rules[0], ...rule, id: rule.id || newId() }))
-    : base.rules;
+  const rules = normalizeRules(input.rules);
+  const filters = normalizeFilters(input.filters);
 
-  const filters = Array.isArray(input.filters)
-    ? input.filters
-        .filter((rule): rule is FilterRule => Boolean(rule) && typeof (rule as FilterRule).match === 'string')
-        .map((rule) => {
-          const mode: FilterMode = rule.mode === 'include' ? 'include' : 'exclude';
-          return {
-            id: rule.id || newId(),
-            enabled: Boolean(rule.enabled),
-            mode,
-            match: rule.match,
-            isRegex: Boolean(rule.isRegex),
-            caseSensitive: Boolean(rule.caseSensitive),
-            tabId: rule.tabId ?? null,
-          };
-        })
-    : [];
-
+  const inputUi = (input.ui ?? {}) as Partial<UiState>;
   const ui: UiState = {
-    ...base.ui,
-    ...(input.ui ?? {}),
+    // Поля перечисляем явно: спред сохранял бы в профиль ключи, которых больше нет в схеме
+    // (например, showLineNumbers из первой версии).
+    fontFamily: typeof inputUi.fontFamily === 'string' && inputUi.fontFamily ? inputUi.fontFamily : base.ui.fontFamily,
+    fontSize: clampNumber(inputUi.fontSize, 8, 32, base.ui.fontSize),
+    rowHeight: clampNumber(inputUi.rowHeight, 12, 48, base.ui.rowHeight),
+    theme: inputUi.theme === 'light' ? 'light' : 'dark',
+    autostart: Boolean(inputUi.autostart),
+    panels: { ...base.ui.panels, ...(inputUi.panels ?? {}) },
   };
-  ui.fontSize = clampNumber(ui.fontSize, 8, 32, base.ui.fontSize);
-  ui.rowHeight = clampNumber(ui.rowHeight, 12, 48, base.ui.rowHeight);
-  ui.theme = ui.theme === 'light' ? 'light' : 'dark';
+  ui.panels.rulesOpen = Boolean(ui.panels.rulesOpen);
+  ui.panels.rulesWidth = clampNumber(ui.panels.rulesWidth, 300, 640, base.ui.panels.rulesWidth);
+  ui.panels.rulesTab = ui.panels.rulesTab === 'filters' ? 'filters' : 'highlight';
 
   const activeTabId =
     typeof input.activeTabId === 'string' && tabs.some((tab) => tab.id === input.activeTabId)
@@ -285,6 +288,76 @@ function normalizeProfile(input: Partial<Profile>): Profile {
       : (tabs[0]?.id ?? null);
 
   return { version: 1, tabs, activeTabId, rules, filters, ui };
+}
+
+function normalizeRules(input: unknown): HighlightRule[] {
+  if (!Array.isArray(input)) return DEFAULT_RULES.map((rule) => ({ ...rule }));
+
+  const rules: HighlightRule[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    const rule = item as Partial<HighlightRule>;
+    if (typeof rule.match !== 'string') continue;
+    const tabId = typeof rule.tabId === 'string' && rule.tabId ? rule.tabId : null;
+    const scoped = rule.scope === 'tab' && tabId !== null;
+    rules.push({
+      id: typeof rule.id === 'string' && rule.id ? rule.id : newId(),
+      enabled: Boolean(rule.enabled),
+      // Паттерн длиннее 500 символов в логе всё равно бесполезен, а UI он разорвёт.
+      match: rule.match.slice(0, 500),
+      isRegex: Boolean(rule.isRegex),
+      caseSensitive: Boolean(rule.caseSensitive),
+      invert: Boolean(rule.invert),
+      fg: normalizeColor(rule.fg, '#ffffff'),
+      bg: normalizeColor(rule.bg, 'transparent'),
+      bold: Boolean(rule.bold),
+      priority: Math.trunc(clampNumber(rule.priority, -10_000, 10_000, 0)),
+      scope: scoped ? 'tab' : 'global',
+      tabId: scoped ? tabId : null,
+      disabledReason: rule.disabledReason === 'timeout' ? 'timeout' : null,
+    });
+  }
+  return rules;
+}
+
+function normalizeFilters(input: unknown): FilterRule[] {
+  if (!Array.isArray(input)) return [];
+
+  const filters: FilterRule[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== 'object') continue;
+    const rule = item as Partial<FilterRule>;
+    if (typeof rule.match !== 'string') continue;
+    filters.push({
+      id: typeof rule.id === 'string' && rule.id ? rule.id : newId(),
+      enabled: Boolean(rule.enabled),
+      mode: rule.mode === 'include' ? 'include' : 'exclude',
+      match: rule.match.slice(0, 500),
+      isRegex: Boolean(rule.isRegex),
+      caseSensitive: Boolean(rule.caseSensitive),
+      tabId: typeof rule.tabId === 'string' && rule.tabId ? rule.tabId : null,
+      disabledReason: rule.disabledReason === 'timeout' ? 'timeout' : null,
+    });
+  }
+  return filters;
+}
+
+/**
+ * Цвет приходит из UI и из старых профилей. Принимаем только `#rgb`, `#rrggbb` и
+ * `transparent`: произвольная CSS-строка в inline-style — это лишняя поверхность.
+ */
+function normalizeColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const color = value.trim().toLowerCase();
+  if (color === 'transparent') return 'transparent';
+  if (/^#[0-9a-f]{6}$/.test(color)) return color;
+  if (/^#[0-9a-f]{3}$/.test(color)) {
+    const r = color.charAt(1);
+    const g = color.charAt(2);
+    const b = color.charAt(3);
+    return `#${r}${r}${g}${g}${b}${b}`;
+  }
+  return fallback;
 }
 
 function clampNumber(value: unknown, min: number, max: number, fallback: number): number {
